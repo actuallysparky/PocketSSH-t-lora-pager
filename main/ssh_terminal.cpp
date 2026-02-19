@@ -29,6 +29,11 @@
 #include <cstring>
 #include <algorithm>
 #include <cinttypes>
+#include <cctype>
+#include <cstdlib>
+#include <cstdio>
+#include <limits>
+#include <set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -105,6 +110,62 @@ static esp_event_handler_instance_t s_instance_any_id = NULL;
 static esp_event_handler_instance_t s_instance_got_ip = NULL;
 
 namespace {
+constexpr const char *kSshConfigPath = "/sdcard/ssh_keys/ssh_config";
+constexpr const char *kSshKeysRoot = "/sdcard/ssh_keys/";
+
+struct SSHConfigOptions {
+    bool has_host_name = false;
+    std::string host_name;
+
+    bool has_user = false;
+    std::string user;
+
+    bool has_port = false;
+    int port = 22;
+
+    bool has_identities_only = false;
+    bool identities_only = false;
+    std::vector<std::string> identity_files;
+
+    bool has_connect_timeout = false;
+    int connect_timeout = 0;
+
+    bool has_server_alive_interval = false;
+    int server_alive_interval = 0;
+
+    bool has_server_alive_count_max = false;
+    int server_alive_count_max = 0;
+
+    bool has_strict_host_key_checking = false;
+    std::string strict_host_key_checking;
+
+    bool has_network = false;
+    std::string network;
+};
+
+struct SSHConfigHostBlock {
+    std::vector<std::string> patterns;
+    SSHConfigOptions options;
+};
+
+struct SSHConfigFile {
+    SSHConfigOptions global_options;
+    std::vector<SSHConfigHostBlock> host_blocks;
+    std::vector<std::string> aliases;
+};
+
+struct ResolvedSSHConfig {
+    bool matched = false;
+    std::string alias;
+    std::string host_name;
+    std::string user;
+    int port = 22;
+    bool identities_only = false;
+    std::vector<std::string> identity_files;
+    std::string strict_host_key_checking = "ask";
+    std::string network;
+};
+
 bool resolve_host_ipv4(const char *host, int port, struct sockaddr_in *out_addr)
 {
     if (host == nullptr || out_addr == nullptr || port <= 0 || port > 65535) {
@@ -164,6 +225,523 @@ std::vector<std::string> split_nonempty_whitespace(const std::string &input)
         parts.push_back(token);
     }
     return parts;
+}
+
+std::vector<std::string> split_quoted_arguments(const std::string &input, size_t start_pos)
+{
+    std::vector<std::string> args;
+    std::string token;
+    bool in_quotes = false;
+    char quote_char = '\0';
+
+    for (size_t i = start_pos; i < input.size(); ++i) {
+        const char c = input[i];
+
+        if ((c == '"' || c == '\'') && (!in_quotes || c == quote_char)) {
+            if (in_quotes) {
+                in_quotes = false;
+                quote_char = '\0';
+            } else {
+                in_quotes = true;
+                quote_char = c;
+            }
+            continue;
+        }
+
+        if (!in_quotes && (c == ' ' || c == '\t')) {
+            if (!token.empty()) {
+                args.push_back(token);
+                token.clear();
+            }
+            continue;
+        }
+
+        token.push_back(c);
+    }
+
+    if (!token.empty()) {
+        args.push_back(token);
+    }
+
+    return args;
+}
+
+std::string trim_ascii(const std::string &value)
+{
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
+std::string strip_inline_comment(const std::string &line)
+{
+    bool in_quotes = false;
+    char quote_char = '\0';
+
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if ((c == '"' || c == '\'') && (!in_quotes || c == quote_char)) {
+            if (in_quotes) {
+                in_quotes = false;
+                quote_char = '\0';
+            } else {
+                in_quotes = true;
+                quote_char = c;
+            }
+            continue;
+        }
+        if (!in_quotes && c == '#') {
+            return line.substr(0, i);
+        }
+    }
+    return line;
+}
+
+std::string lowercase_ascii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string trim_matching_quotes(const std::string &value)
+{
+    if (value.size() >= 2) {
+        const char first = value.front();
+        const char last = value.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return value.substr(1, value.size() - 2);
+        }
+    }
+    return value;
+}
+
+bool split_directive(const std::string &line, std::string *key, std::string *value)
+{
+    if (key == nullptr || value == nullptr) {
+        return false;
+    }
+
+    const size_t eq = line.find('=');
+    if (eq != std::string::npos) {
+        *key = trim_ascii(line.substr(0, eq));
+        *value = trim_ascii(line.substr(eq + 1));
+        return !key->empty() && !value->empty();
+    }
+
+    const size_t ws = line.find_first_of(" \t");
+    if (ws == std::string::npos) {
+        return false;
+    }
+
+    *key = trim_ascii(line.substr(0, ws));
+    *value = trim_ascii(line.substr(ws + 1));
+    return !key->empty() && !value->empty();
+}
+
+bool parse_int32(const std::string &value, int *out)
+{
+    if (out == nullptr || value.empty()) {
+        return false;
+    }
+
+    char *end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0') {
+        return false;
+    }
+    if (parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    *out = static_cast<int>(parsed);
+    return true;
+}
+
+bool parse_bool_flag(const std::string &value, bool *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+
+    const std::string lowered = lowercase_ascii(trim_ascii(value));
+    if (lowered == "yes" || lowered == "true" || lowered == "on" || lowered == "1") {
+        *out = true;
+        return true;
+    }
+    if (lowered == "no" || lowered == "false" || lowered == "off" || lowered == "0") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+std::string expand_identity_file_path(std::string path)
+{
+    path = trim_matching_quotes(trim_ascii(path));
+    if (path.empty()) {
+        return path;
+    }
+
+    if (path.rfind("~/.ssh/", 0) == 0) {
+        return std::string(kSshKeysRoot) + path.substr(7);
+    }
+
+    if (path.rfind("/sdcard/ssh_keys/", 0) == 0) {
+        return path;
+    }
+
+    if (path[0] != '/') {
+        return std::string(kSshKeysRoot) + path;
+    }
+
+    return path;
+}
+
+std::string base_name(const std::string &path)
+{
+    const size_t sep = path.find_last_of('/');
+    if (sep == std::string::npos) {
+        return path;
+    }
+    return path.substr(sep + 1);
+}
+
+bool wildcard_match(const std::string &pattern, const std::string &candidate)
+{
+    const std::string pat = lowercase_ascii(pattern);
+    const std::string text = lowercase_ascii(candidate);
+
+    size_t p = 0;
+    size_t t = 0;
+    size_t star = std::string::npos;
+    size_t match = 0;
+
+    while (t < text.size()) {
+        if (p < pat.size() && (pat[p] == '?' || pat[p] == text[t])) {
+            ++p;
+            ++t;
+        } else if (p < pat.size() && pat[p] == '*') {
+            star = p++;
+            match = t;
+        } else if (star != std::string::npos) {
+            p = star + 1;
+            t = ++match;
+        } else {
+            return false;
+        }
+    }
+
+    while (p < pat.size() && pat[p] == '*') {
+        ++p;
+    }
+
+    return p == pat.size();
+}
+
+bool host_block_matches(const SSHConfigHostBlock &block, const std::string &alias)
+{
+    bool has_positive = false;
+    bool positive_match = false;
+
+    for (const std::string &raw_pattern : block.patterns) {
+        if (raw_pattern.empty()) {
+            continue;
+        }
+
+        if (raw_pattern[0] == '!') {
+            const std::string neg = raw_pattern.substr(1);
+            if (!neg.empty() && wildcard_match(neg, alias)) {
+                return false;
+            }
+            continue;
+        }
+
+        has_positive = true;
+        if (wildcard_match(raw_pattern, alias)) {
+            positive_match = true;
+        }
+    }
+
+    return has_positive && positive_match;
+}
+
+void apply_option(const std::string &directive, const std::string &raw_value, SSHConfigOptions *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    const std::string value = trim_matching_quotes(trim_ascii(raw_value));
+
+    if (directive == "hostname") {
+        target->host_name = value;
+        target->has_host_name = true;
+        return;
+    }
+    if (directive == "user") {
+        target->user = value;
+        target->has_user = true;
+        return;
+    }
+    if (directive == "port") {
+        int parsed_port = 0;
+        if (parse_int32(value, &parsed_port) && parsed_port > 0 && parsed_port <= 65535) {
+            target->port = parsed_port;
+            target->has_port = true;
+        }
+        return;
+    }
+    if (directive == "identityfile") {
+        const std::string expanded = expand_identity_file_path(value);
+        if (!expanded.empty()) {
+            target->identity_files.push_back(expanded);
+        }
+        return;
+    }
+    if (directive == "identitiesonly") {
+        bool parsed = false;
+        if (parse_bool_flag(value, &parsed)) {
+            target->identities_only = parsed;
+            target->has_identities_only = true;
+        }
+        return;
+    }
+    if (directive == "connecttimeout") {
+        int timeout = 0;
+        if (parse_int32(value, &timeout) && timeout >= 0) {
+            target->connect_timeout = timeout;
+            target->has_connect_timeout = true;
+        }
+        return;
+    }
+    if (directive == "serveraliveinterval") {
+        int interval = 0;
+        if (parse_int32(value, &interval) && interval >= 0) {
+            target->server_alive_interval = interval;
+            target->has_server_alive_interval = true;
+        }
+        return;
+    }
+    if (directive == "serveralivecountmax") {
+        int max_count = 0;
+        if (parse_int32(value, &max_count) && max_count >= 0) {
+            target->server_alive_count_max = max_count;
+            target->has_server_alive_count_max = true;
+        }
+        return;
+    }
+    if (directive == "stricthostkeychecking") {
+        target->strict_host_key_checking = lowercase_ascii(value);
+        target->has_strict_host_key_checking = true;
+        return;
+    }
+    if (directive == "network" || directive == "tpagernetwork") {
+        target->network = value;
+        target->has_network = true;
+        return;
+    }
+}
+
+void merge_options(const SSHConfigOptions &source, SSHConfigOptions *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    if (source.has_host_name) {
+        target->host_name = source.host_name;
+        target->has_host_name = true;
+    }
+    if (source.has_user) {
+        target->user = source.user;
+        target->has_user = true;
+    }
+    if (source.has_port) {
+        target->port = source.port;
+        target->has_port = true;
+    }
+    if (source.has_identities_only) {
+        target->identities_only = source.identities_only;
+        target->has_identities_only = true;
+    }
+    if (!source.identity_files.empty()) {
+        target->identity_files.insert(target->identity_files.end(),
+                                      source.identity_files.begin(),
+                                      source.identity_files.end());
+    }
+    if (source.has_connect_timeout) {
+        target->connect_timeout = source.connect_timeout;
+        target->has_connect_timeout = true;
+    }
+    if (source.has_server_alive_interval) {
+        target->server_alive_interval = source.server_alive_interval;
+        target->has_server_alive_interval = true;
+    }
+    if (source.has_server_alive_count_max) {
+        target->server_alive_count_max = source.server_alive_count_max;
+        target->has_server_alive_count_max = true;
+    }
+    if (source.has_strict_host_key_checking) {
+        target->strict_host_key_checking = source.strict_host_key_checking;
+        target->has_strict_host_key_checking = true;
+    }
+    if (source.has_network) {
+        target->network = source.network;
+        target->has_network = true;
+    }
+}
+
+bool parse_ssh_config_file(SSHConfigFile *parsed)
+{
+    if (parsed == nullptr) {
+        return false;
+    }
+
+    *parsed = {};
+
+    FILE *file = std::fopen(kSshConfigPath, "r");
+    if (file == nullptr) {
+        return false;
+    }
+
+    std::set<std::string> alias_seen;
+    SSHConfigHostBlock *active_host = nullptr;
+    bool saw_host = false;
+    char line_buffer[512];
+    while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
+        std::string line = line_buffer;
+        line = trim_ascii(strip_inline_comment(line));
+        if (line.empty()) {
+            continue;
+        }
+
+        std::string key;
+        std::string value;
+        if (!split_directive(line, &key, &value)) {
+            continue;
+        }
+
+        const std::string directive = lowercase_ascii(key);
+        if (directive == "host") {
+            const std::vector<std::string> patterns = split_nonempty_whitespace(value);
+            if (patterns.empty()) {
+                continue;
+            }
+
+            saw_host = true;
+            parsed->host_blocks.push_back({});
+            active_host = &parsed->host_blocks.back();
+            active_host->patterns = patterns;
+
+            for (const std::string &pattern : patterns) {
+                if (pattern.empty() || pattern[0] == '!') {
+                    continue;
+                }
+                if (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos) {
+                    continue;
+                }
+                if (alias_seen.insert(pattern).second) {
+                    parsed->aliases.push_back(pattern);
+                }
+            }
+            continue;
+        }
+
+        SSHConfigOptions *target = (!saw_host || active_host == nullptr)
+                                       ? &parsed->global_options
+                                       : &active_host->options;
+        apply_option(directive, value, target);
+    }
+
+    std::fclose(file);
+    return true;
+}
+
+bool resolve_ssh_alias(const std::string &alias, ResolvedSSHConfig *resolved)
+{
+    if (resolved == nullptr || alias.empty()) {
+        return false;
+    }
+
+    SSHConfigFile parsed = {};
+    if (!parse_ssh_config_file(&parsed)) {
+        return false;
+    }
+
+    SSHConfigOptions effective = {};
+    merge_options(parsed.global_options, &effective);
+
+    bool matched = false;
+    for (const auto &block : parsed.host_blocks) {
+        if (host_block_matches(block, alias)) {
+            merge_options(block.options, &effective);
+            matched = true;
+        }
+    }
+
+    if (!matched) {
+        return false;
+    }
+
+    resolved->matched = true;
+    resolved->alias = alias;
+    resolved->host_name = effective.has_host_name ? effective.host_name : alias;
+    resolved->user = effective.has_user ? effective.user : "";
+    resolved->port = effective.has_port ? effective.port : 22;
+    resolved->identities_only = effective.has_identities_only ? effective.identities_only : false;
+    resolved->identity_files = effective.identity_files;
+    resolved->strict_host_key_checking = effective.has_strict_host_key_checking
+                                             ? effective.strict_host_key_checking
+                                             : "ask";
+    resolved->network = effective.has_network ? effective.network : "";
+    return true;
+}
+
+bool read_file_contents(const std::string &path, std::string *contents)
+{
+    if (contents == nullptr) {
+        return false;
+    }
+
+    FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        return false;
+    }
+
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    const long file_size = std::ftell(file);
+    if (file_size <= 0) {
+        std::fclose(file);
+        return false;
+    }
+    if (std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+
+    std::string data(static_cast<size_t>(file_size), '\0');
+    const size_t read_count = std::fread(data.data(), 1, static_cast<size_t>(file_size), file);
+    std::fclose(file);
+
+    if (read_count != static_cast<size_t>(file_size)) {
+        return false;
+    }
+
+    *contents = std::move(data);
+    return true;
 }
 } // namespace
 
@@ -536,7 +1114,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     const char* logo =
         "PocketSSH T-Pager\n"
         "Type 'help' for commands.\n"
-        "Start with: connect <SSID> <PASSWORD>\n\n";
+        "Start with: hosts, connect <alias>, or connect <SSID> <PASSWORD>\n\n";
     #else
     const char* logo = 
         "\n"
@@ -545,8 +1123,10 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
         "  ================================================\n"
         "\n"
         "  Commands:\n"
+        "   connect <ALIAS> - Resolve via ssh_config and SSH key\n"
         "   connect <SSID> <PASSWORD>  - WiFi connect\n"
         "     Use quotes for spaces: connect \"My WiFi\" \"my pass\"\n"
+        "   hosts - List aliases from /sdcard/ssh_keys/ssh_config\n"
         "   ssh <HOST> <PORT> <USER> <PASS> - SSH\n"
         "   sshkey <HOST> <PORT> <USER> <KEYFILE> - SSH key\n"
         "   disconnect - WiFi off | exit - SSH off\n"
@@ -617,31 +1197,79 @@ void SSHTerminal::handle_key_input(char key)
             append_text("\n");
             
             if (current_input.rfind("connect ", 0) == 0) {
-                // Parse arguments with support for quoted strings (for SSIDs/passwords with spaces)
-                std::vector<std::string> args;
-                std::string arg;
-                bool in_quotes = false;
-                
-                // Skip "connect " prefix
-                for (size_t i = 8; i < current_input.length(); i++) {
-                    char c = current_input[i];
-                    
-                    if (c == '"') {
-                        in_quotes = !in_quotes;
-                    } else if (c == ' ' && !in_quotes) {
-                        if (!arg.empty()) {
-                            args.push_back(arg);
-                            arg.clear();
-                        }
+                const std::vector<std::string> args = split_quoted_arguments(current_input, 8);
+
+                if (args.size() == 1) {
+                    const std::string alias = args[0];
+                    ResolvedSSHConfig resolved = {};
+                    if (!resolve_ssh_alias(alias, &resolved)) {
+                        append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
+                        append_text("Hint: run 'hosts' to list available aliases.\n");
+                    } else if (!wifi_connected) {
+                        append_text("ERROR: WiFi not connected\n");
+                        append_text("Use: connect <SSID> <PASSWORD>\n");
+                    } else if (resolved.user.empty()) {
+                        append_text("ERROR: ssh_config alias missing User directive\n");
                     } else {
-                        arg += c;
+                        char resolved_line[196];
+                        std::snprintf(resolved_line, sizeof(resolved_line),
+                                      "Resolved %s -> %s:%d as %s\n",
+                                      resolved.alias.c_str(),
+                                      resolved.host_name.c_str(),
+                                      resolved.port,
+                                      resolved.user.c_str());
+                        append_text(resolved_line);
+
+                        bool attempted_identity = false;
+                        bool connected = false;
+                        for (const std::string &identity_path : resolved.identity_files) {
+                            const std::string key_name = base_name(identity_path);
+                            size_t key_len = 0;
+                            const char *loaded_key = get_loaded_key(key_name.c_str(), &key_len);
+
+                            append_text("Trying identity: ");
+                            append_text(identity_path.c_str());
+                            append_text("\n");
+
+                            attempted_identity = true;
+                            if (loaded_key != nullptr && key_len > 0) {
+                                if (connect_with_key(resolved.host_name.c_str(),
+                                                     resolved.port,
+                                                     resolved.user.c_str(),
+                                                     loaded_key,
+                                                     key_len) == ESP_OK) {
+                                    connected = true;
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            std::string key_data;
+                            if (!read_file_contents(identity_path, &key_data)) {
+                                append_text("  Skipping: unable to read key file\n");
+                                continue;
+                            }
+
+                            if (connect_with_key(resolved.host_name.c_str(),
+                                                 resolved.port,
+                                                 resolved.user.c_str(),
+                                                 key_data.c_str(),
+                                                 key_data.size()) == ESP_OK) {
+                                connected = true;
+                                break;
+                            }
+                        }
+
+                        if (!connected) {
+                            if (!attempted_identity) {
+                                append_text("ERROR: Alias has no IdentityFile entries\n");
+                                append_text("Add IdentityFile in ssh_config or use ssh/sshkey command directly.\n");
+                            } else {
+                                append_text("ERROR: All configured identity files failed\n");
+                            }
+                        }
                     }
-                }
-                if (!arg.empty()) {
-                    args.push_back(arg);
-                }
-                
-                if (args.size() >= 2) {
+                } else if (args.size() >= 2) {
                     std::string ssid = args[0];
                     std::string password = args[1];
                     
@@ -655,7 +1283,9 @@ void SSHTerminal::handle_key_input(char key)
                         append_text("WiFi connection failed!\n");
                     }
                 } else {
-                    append_text("Usage: connect <SSID> <PASSWORD>\n");
+                    append_text("Usage:\n");
+                    append_text("  connect <ALIAS>\n");
+                    append_text("  connect <SSID> <PASSWORD>\n");
                     append_text("  Use quotes for SSIDs/passwords with spaces: connect \"My WiFi\" password\n");
                 }
             }
@@ -735,6 +1365,8 @@ void SSHTerminal::handle_key_input(char key)
             }
             else if (current_input == "help") {
                 append_text("Available commands:\n");
+                append_text("  hosts - List aliases from /sdcard/ssh_keys/ssh_config\n");
+                append_text("  connect <ALIAS> - Resolve alias from ssh_config and connect via key\n");
                 append_text("  connect <SSID> <PASSWORD> - Connect to WiFi\n");
                 append_text("    Use quotes for spaces: connect \"My WiFi\" password\n");
                 append_text("  netinfo - Show WiFi IP/netmask/gateway\n");
@@ -745,6 +1377,21 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("  exit - Disconnect SSH\n");
                 append_text("  clear - Clear terminal\n");
                 append_text("  help - Show this help\n");
+            }
+            else if (current_input == "hosts") {
+                SSHConfigFile parsed = {};
+                if (!parse_ssh_config_file(&parsed)) {
+                    append_text("No ssh_config found at /sdcard/ssh_keys/ssh_config\n");
+                } else if (parsed.aliases.empty()) {
+                    append_text("No explicit Host aliases found in ssh_config\n");
+                } else {
+                    append_text("Configured Host aliases:\n");
+                    for (const std::string &alias : parsed.aliases) {
+                        append_text("  ");
+                        append_text(alias.c_str());
+                        append_text("\n");
+                    }
+                }
             }
             else if (current_input == "netinfo") {
                 if (!wifi_connected) {

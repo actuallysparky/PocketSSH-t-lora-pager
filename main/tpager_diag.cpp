@@ -11,6 +11,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdio>
+#include <string>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -160,6 +161,32 @@ const char *key_name(tpager::Tca8418Key key)
     }
 }
 
+bool to_terminal_byte(const tpager::Tca8418Event &ev, uint8_t *out_byte)
+{
+    if (out_byte == nullptr || !ev.pressed) {
+        return false;
+    }
+
+    switch (ev.key) {
+    case tpager::Tca8418Key::Character:
+    case tpager::Tca8418Key::Space:
+        if (ev.ch != '\0') {
+            *out_byte = static_cast<uint8_t>(ev.ch);
+            return true;
+        }
+        break;
+    case tpager::Tca8418Key::Enter:
+        *out_byte = '\r';
+        return true;
+    case tpager::Tca8418Key::Backspace:
+        *out_byte = 0x7F;
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
 void diag_keyboard_events(uint32_t sample_ms)
 {
     ESP_LOGI(kTag, "diag_keyboard_events: init matrix=4x10 (polling mode, IRQ pin=%d)", kKeyboardIrq);
@@ -178,6 +205,7 @@ void diag_keyboard_events(uint32_t sample_ms)
     int32_t events = 0;
     int32_t presses = 0;
     int32_t releases = 0;
+    std::string echo_line;
 
     while ((esp_timer_get_time() - start_us) < static_cast<int64_t>(sample_ms) * 1000) {
         tpager::Tca8418Event ev = {};
@@ -214,6 +242,21 @@ void diag_keyboard_events(uint32_t sample_ms)
                              "diag_keyboard_events: raw=0x%02X code=%u row=%u col=%u %s key=%s",
                              ev.raw, ev.code, ev.row, ev.col, ev.pressed ? "PRESSED" : "RELEASED",
                              key_name(ev.key));
+                }
+
+                uint8_t tx_byte = 0;
+                if (to_terminal_byte(ev, &tx_byte)) {
+                    ESP_LOGI(kTag, "diag_keyboard_events: tx_byte=0x%02X", tx_byte);
+                    if (tx_byte == 0x7F) {
+                        if (!echo_line.empty()) {
+                            echo_line.pop_back();
+                        }
+                    } else if (tx_byte == '\r') {
+                        ESP_LOGI(kTag, "diag_keyboard_events: echo_submit=\"%s\"", echo_line.c_str());
+                        echo_line.clear();
+                    } else if (tx_byte >= 0x20 && tx_byte <= 0x7E) {
+                        echo_line.push_back(static_cast<char>(tx_byte));
+                    }
                 }
             }
         } else if (ret != ESP_ERR_NOT_FOUND) {

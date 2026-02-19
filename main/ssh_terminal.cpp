@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <cerrno>
 
 static const char *TAG = "SSH_TERMINAL";
 
@@ -622,8 +623,12 @@ void SSHTerminal::handle_key_input(char key)
                     int port = std::atoi(parts[2].c_str());
                     std::string user = parts[3];
                     std::string pass = parts[4];
-                    
-                    connect(host.c_str(), port, user.c_str(), pass.c_str());
+
+                    if (port <= 0 || port > 65535) {
+                        append_text("ERROR: Invalid port for ssh command\n");
+                    } else {
+                        connect(host.c_str(), port, user.c_str(), pass.c_str());
+                    }
                 } else {
                     append_text("Usage: ssh <HOST> <PORT> <USER> <PASS>\n");
                 }
@@ -636,26 +641,30 @@ void SSHTerminal::handle_key_input(char key)
                     int port = std::atoi(parts[2].c_str());
                     std::string user = parts[3];
                     std::string keyfile = parts[4];
-                    
-                    // Try to load key from memory
-                    size_t key_len = 0;
-                    const char* key_data = get_loaded_key(keyfile.c_str(), &key_len);
-                    
-                    if (key_data && key_len > 0) {
-                        append_text("Using key file: ");
-                        append_text(keyfile.c_str());
-                        append_text("\n");
-                        connect_with_key(host.c_str(), port, user.c_str(), key_data, key_len);
+
+                    if (port <= 0 || port > 65535) {
+                        append_text("ERROR: Invalid port for sshkey command\n");
                     } else {
-                        append_text("ERROR: Key file not found: ");
-                        append_text(keyfile.c_str());
-                        append_text("\n");
-                        append_text("Available keys: ");
-                        for (const auto& kv : loaded_keys) {
-                            append_text(kv.first.c_str());
-                            append_text(" ");
+                        // Try to load key from memory
+                        size_t key_len = 0;
+                        const char* key_data = get_loaded_key(keyfile.c_str(), &key_len);
+
+                        if (key_data && key_len > 0) {
+                            append_text("Using key file: ");
+                            append_text(keyfile.c_str());
+                            append_text("\n");
+                            connect_with_key(host.c_str(), port, user.c_str(), key_data, key_len);
+                        } else {
+                            append_text("ERROR: Key file not found: ");
+                            append_text(keyfile.c_str());
+                            append_text("\n");
+                            append_text("Available keys: ");
+                            for (const auto& kv : loaded_keys) {
+                                append_text(kv.first.c_str());
+                                append_text(" ");
+                            }
+                            append_text("\n");
                         }
-                        append_text("\n");
                     }
                 } else {
                     append_text("Usage: sshkey <HOST> <PORT> <USER> <KEYFILE>\n");
@@ -1158,6 +1167,11 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
         libssh2_exit();
         return ESP_FAIL;
     }
+    char resolved_ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &sin.sin_addr, resolved_ip, sizeof(resolved_ip));
+    append_text("Resolved to ");
+    append_text(resolved_ip);
+    append_text("\n");
 
     struct timeval timeout;
     timeout.tv_sec = 10;
@@ -1166,8 +1180,12 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
     setsockopt(ssh_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (::connect(ssh_socket, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
+        const int err = errno;
         ESP_LOGE(TAG, "Failed to connect socket");
         append_text("ERROR: Failed to connect socket\n");
+        char err_line[96];
+        std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
+        append_text(err_line);
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1262,6 +1280,11 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
         libssh2_exit();
         return ESP_FAIL;
     }
+    char resolved_ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &sin.sin_addr, resolved_ip, sizeof(resolved_ip));
+    append_text("Resolved to ");
+    append_text(resolved_ip);
+    append_text("\n");
 
     struct timeval timeout;
     timeout.tv_sec = 10;
@@ -1270,8 +1293,12 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
     setsockopt(ssh_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (::connect(ssh_socket, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
+        const int err = errno;
         ESP_LOGE(TAG, "Failed to connect socket");
         append_text("ERROR: Failed to connect socket\n");
+        char err_line[96];
+        std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
+        append_text(err_line);
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();

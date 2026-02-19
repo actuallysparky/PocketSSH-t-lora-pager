@@ -47,6 +47,11 @@ constexpr gpio_num_t kEncoderA = GPIO_NUM_40;
 constexpr gpio_num_t kEncoderB = GPIO_NUM_41;
 constexpr gpio_num_t kEncoderCenter = GPIO_NUM_7;
 
+// Temporary test hook: auto-connect Wi-Fi at boot to speed SSH validation loops.
+constexpr bool kBootAutoWifiConnect = true;
+constexpr const char *kBootWifiSsid = "REDACTED_WIFI";
+constexpr const char *kBootWifiPassword = "REDACTED_WIFI";
+
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
 
@@ -346,6 +351,24 @@ void runtime_task(void *)
     }
 }
 
+void wifi_autoconnect_task(void *)
+{
+    if (!kBootAutoWifiConnect || g_terminal == nullptr) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    vTaskDelay(ticks_from_ms(500));
+    append_terminal_text("Auto WiFi: connecting to REDACTED_WIFI...\n");
+    const esp_err_t ret = g_terminal->init_wifi(kBootWifiSsid, kBootWifiPassword);
+    if (ret == ESP_OK) {
+        append_terminal_text("Auto WiFi: connected\n");
+    } else {
+        append_terminal_text("Auto WiFi: failed\n");
+    }
+    vTaskDelete(nullptr);
+}
+
 }  // namespace
 
 extern "C" void app_main(void)
@@ -425,6 +448,10 @@ extern "C" void app_main(void)
     }
 
     load_ssh_keys_from_sd();
+
+    if (kBootAutoWifiConnect) {
+        xTaskCreatePinnedToCore(wifi_autoconnect_task, "tpager_wifi_auto_task", 6144, nullptr, 4, nullptr, 1);
+    }
 
     xTaskCreatePinnedToCore(runtime_task, "tpager_runtime_task", 8192, nullptr, 5, nullptr, 1);
 

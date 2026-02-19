@@ -23,7 +23,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "tpager_display.hpp"
 #include "tpager_encoder.hpp"
+#include "tpager_sd.hpp"
 #include "tpager_tca8418.hpp"
 #include "tpager_xl9555.hpp"
 
@@ -53,8 +55,24 @@ constexpr TickType_t kI2CTimeoutTicks = ticks_from_ms(20);
 tpager::Xl9555 g_xl9555;
 tpager::Tca8418 g_tca8418;
 tpager::Tca8418State g_tca8418_state;
+tpager::DiagDisplay g_display;
 std::vector<std::string> g_echo_history;
 constexpr size_t kMaxEchoHistory = 24;
+TaskHandle_t g_diag_task_handle = nullptr;
+volatile uint32_t g_keyboard_irq_count = 0;
+
+void IRAM_ATTR keyboard_irq_isr(void *)
+{
+    g_keyboard_irq_count = g_keyboard_irq_count + 1;
+    if (g_diag_task_handle == nullptr) {
+        return;
+    }
+    BaseType_t high_priority_wakeup = pdFALSE;
+    vTaskNotifyGiveFromISR(g_diag_task_handle, &high_priority_wakeup);
+    if (high_priority_wakeup == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 esp_err_t i2c_init()
 {
@@ -204,7 +222,8 @@ void push_echo_history(std::string line)
 
 void diag_keyboard_events(uint32_t sample_ms)
 {
-    ESP_LOGI(kTag, "diag_keyboard_events: init matrix=4x10 (polling mode, IRQ pin=%d)", kKeyboardIrq);
+    ESP_LOGI(kTag, "diag_keyboard_events: init matrix=4x10 (polling+IRQ mode, IRQ pin=%d)", kKeyboardIrq);
+    tpager::diag_display_set_stage(&g_display, "Stage: keyboard polling");
     ESP_ERROR_CHECK(tpager::tca8418_configure_matrix(&g_tca8418, 4, 10));
     ESP_ERROR_CHECK(tpager::tca8418_flush_fifo(g_tca8418));
 
@@ -213,19 +232,44 @@ void diag_keyboard_events(uint32_t sample_ms)
     irq_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
     irq_cfg.pin_bit_mask = (1ULL << kKeyboardIrq);
     ESP_ERROR_CHECK(gpio_config(&irq_cfg));
+    gpio_set_intr_type(kKeyboardIrq, GPIO_INTR_NEGEDGE);
+    esp_err_t isr_ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_ret);
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(kKeyboardIrq, keyboard_irq_isr, nullptr));
+    g_diag_task_handle = xTaskGetCurrentTaskHandle();
+    g_keyboard_irq_count = 0;
 
-    ESP_LOGI(kTag, "diag_keyboard_events: sampling for %" PRIu32 " ms; press a few keys now", sample_ms);
+    ESP_LOGI(kTag, "diag_keyboard_events: sampling for %" PRIu32 " ms; press keys now", sample_ms);
     int64_t start_us = esp_timer_get_time();
     int64_t last_report_us = start_us;
     int32_t events = 0;
     int32_t presses = 0;
     int32_t releases = 0;
+    int32_t irq_wakes = 0;
     std::string echo_line;
+    tpager::diag_display_set_keyboard_stats(&g_display, events, presses, releases, gpio_get_level(kKeyboardIrq));
 
     while ((esp_timer_get_time() - start_us) < static_cast<int64_t>(sample_ms) * 1000) {
-        tpager::Tca8418Event ev = {};
-        esp_err_t ret = tpager::tca8418_poll_event(g_tca8418, &g_tca8418_state, &ev);
-        if (ret == ESP_OK && ev.valid) {
+        if (ulTaskNotifyTake(pdTRUE, ticks_from_ms(20)) > 0) {
+            irq_wakes++;
+        }
+
+        while (true) {
+            tpager::Tca8418Event ev = {};
+            esp_err_t ret = tpager::tca8418_poll_event(g_tca8418, &g_tca8418_state, &ev);
+            if (ret == ESP_ERR_NOT_FOUND) {
+                break;
+            }
+            if (ret != ESP_OK) {
+                ESP_LOGW(kTag, "diag_keyboard_events: poll error: %s", esp_err_to_name(ret));
+                break;
+            }
+            if (!ev.valid) {
+                break;
+            }
+
             ++events;
             if (ev.pressed) {
                 ++presses;
@@ -269,28 +313,33 @@ void diag_keyboard_events(uint32_t sample_ms)
                     } else if (tx_byte == '\r') {
                         ESP_LOGI(kTag, "diag_keyboard_events: echo_submit=\"%s\"", echo_line.c_str());
                         push_echo_history(echo_line);
+                        tpager::diag_display_set_last_line(&g_display, echo_line.c_str());
                         echo_line.clear();
                     } else if (tx_byte >= 0x20 && tx_byte <= 0x7E) {
                         echo_line.push_back(static_cast<char>(tx_byte));
                     }
                 }
             }
-        } else if (ret != ESP_ERR_NOT_FOUND) {
-            ESP_LOGW(kTag, "diag_keyboard_events: poll error: %s", esp_err_to_name(ret));
         }
 
         int64_t now_us = esp_timer_get_time();
         if ((now_us - last_report_us) >= 1000000) {
             int irq_level = gpio_get_level(kKeyboardIrq);
-            ESP_LOGI(kTag, "diag_keyboard_events: irq=%d events=%" PRId32 " (p=%" PRId32 ", r=%" PRId32 ")",
-                     irq_level, events, presses, releases);
+            uint32_t irq_total = g_keyboard_irq_count;
+            ESP_LOGI(kTag,
+                     "diag_keyboard_events: irq=%d irq_total=%" PRIu32 " wakes=%" PRId32
+                     " events=%" PRId32 " (p=%" PRId32 ", r=%" PRId32 ")",
+                     irq_level, irq_total, irq_wakes, events, presses, releases);
+            tpager::diag_display_set_keyboard_stats(&g_display, events, presses, releases, irq_level);
             last_report_us = now_us;
         }
-        vTaskDelay(1);
     }
 
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_remove(kKeyboardIrq));
+    g_diag_task_handle = nullptr;
     ESP_LOGI(kTag, "diag_keyboard_events: done events=%" PRId32 " (p=%" PRId32 ", r=%" PRId32 ")",
              events, presses, releases);
+    tpager::diag_display_set_keyboard_stats(&g_display, events, presses, releases, gpio_get_level(kKeyboardIrq));
 }
 
 bool diag_keyboard_reset(uint8_t kb_power_pin)
@@ -329,12 +378,14 @@ bool diag_keyboard_reset(uint8_t kb_power_pin)
 void diag_encoder_ticks(uint32_t sample_ms)
 {
     ESP_LOGI(kTag, "diag_encoder_ticks: start (%" PRIu32 " ms)", sample_ms);
+    tpager::diag_display_set_stage(&g_display, "Stage: encoder polling");
     tpager::Encoder enc = {};
     ESP_ERROR_CHECK(tpager::encoder_init(&enc, kEncoderA, kEncoderB, kEncoderCenter));
 
     int32_t net = 0;
     int32_t transitions = 0;
     int32_t history_index = g_echo_history.empty() ? -1 : static_cast<int32_t>(g_echo_history.size() - 1);
+    tpager::diag_display_set_encoder_stats(&g_display, net, transitions);
 
     int64_t start_us = esp_timer_get_time();
     int64_t last_report_us = start_us;
@@ -355,7 +406,9 @@ void diag_encoder_ticks(uint32_t sample_ms)
                                                static_cast<int32_t>(g_echo_history.size() - 1));
                     ESP_LOGI(kTag, "diag_encoder_ticks: history[%ld]=\"%s\"",
                              static_cast<long>(history_index), g_echo_history[history_index].c_str());
+                    tpager::diag_display_set_last_line(&g_display, g_echo_history[history_index].c_str());
                 }
+                tpager::diag_display_set_encoder_stats(&g_display, net, transitions);
             }
             if (ev.button_changed) {
                 ESP_LOGI(kTag, "diag_encoder_ticks: center=%s", ev.button_pressed ? "pressed" : "released");
@@ -367,12 +420,51 @@ void diag_encoder_ticks(uint32_t sample_ms)
         int64_t now_us = esp_timer_get_time();
         if ((now_us - last_report_us) >= 1000000) {
             ESP_LOGI(kTag, "diag_encoder_ticks: net=%" PRId32 ", transitions=%" PRId32, net, transitions);
+            tpager::diag_display_set_encoder_stats(&g_display, net, transitions);
             last_report_us = now_us;
         }
         vTaskDelay(1);
     }
 
     ESP_LOGI(kTag, "diag_encoder_ticks: done net=%" PRId32 ", transitions=%" PRId32, net, transitions);
+    tpager::diag_display_set_encoder_stats(&g_display, net, transitions);
+}
+
+void diag_sd_card()
+{
+    tpager::diag_display_set_stage(&g_display, "Stage: SD mount");
+
+    // Contract: enable SD rail through XL9555 before SDSPI mount attempt.
+    if (tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, true) == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, true));
+    } else {
+        ESP_LOGW(kTag, "diag_sd: failed to set SD power pin direction");
+    }
+
+    bool sd_detect_level = true;
+    if (tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_SD_DETECT, false) == ESP_OK &&
+        tpager::xl9555_read_pin(g_xl9555, tpager::XL9555_PIN_SD_DETECT, &sd_detect_level) == ESP_OK) {
+        ESP_LOGI(kTag, "diag_sd: SD detect level=%d (board-dependent polarity)", sd_detect_level ? 1 : 0);
+    } else {
+        ESP_LOGW(kTag, "diag_sd: unable to read SD detect pin");
+    }
+
+    tpager::SdDiagStats stats = {};
+    esp_err_t ret = tpager::sd_mount_and_scan_keys(&stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "diag_sd: mount/scan failed: %s", esp_err_to_name(ret));
+        tpager::diag_display_set_last_line(&g_display, "SD mount failed");
+        return;
+    }
+
+    ESP_LOGI(kTag, "diag_sd: mounted=%d created_dir=%d entries=%" PRId32 " pem=%" PRId32, stats.mounted ? 1 : 0,
+             stats.keys_dir_created ? 1 : 0, stats.dir_entries, stats.pem_files);
+    char line[96];
+    std::snprintf(line, sizeof(line), "SD pem=%" PRId32 " entries=%" PRId32, stats.pem_files, stats.dir_entries);
+    tpager::diag_display_set_last_line(&g_display, line);
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
 }
 
 void run_diag()
@@ -382,7 +474,17 @@ void run_diag()
     ESP_LOGI(kTag, "Expected I2C devices: XL9555@0x%02X, TCA8418@0x%02X", g_xl9555.address, kTCA8418Addr);
     ESP_LOGI(kTag, "Encoder: A=%d B=%d Center=%d", kEncoderA, kEncoderB, kEncoderCenter);
 
+    esp_err_t display_ret = tpager::diag_display_init(&g_display);
+    if (display_ret == ESP_OK) {
+        tpager::diag_display_set_stage(&g_display, "Stage: display online");
+        tpager::diag_display_set_last_line(&g_display, "<none>");
+    } else {
+        ESP_LOGW(kTag, "Display bring-up failed: %s (continuing with serial diagnostics)",
+                 esp_err_to_name(display_ret));
+    }
+
     ESP_ERROR_CHECK(i2c_init());
+    tpager::diag_display_set_stage(&g_display, "Stage: I2C scan");
     ESP_ERROR_CHECK(tpager::xl9555_init(&g_xl9555, kI2CPort, 0x20, kI2CTimeoutTicks));
     ESP_ERROR_CHECK(tpager::tca8418_init(&g_tca8418, kI2CPort, kTCA8418Addr, kI2CTimeoutTicks));
     diag_i2c_scan();
@@ -391,6 +493,7 @@ void run_diag()
         ESP_LOGE(kTag, "XL9555 not detected at 0x%02X; keyboard reset/power diagnostics skipped", g_xl9555.address);
     } else {
         diag_xl9555_dump();
+        diag_sd_card();
 
         ESP_LOGW(kTag,
                  "LilyGo docs conflict for keyboard power gate (GPIO10 vs GPIO8). Trying GPIO10 first, then GPIO8.");
@@ -408,11 +511,14 @@ void run_diag()
         if (keyboard_ok) {
             // Polling-first per bring-up strategy. IRQ observation is logged as telemetry only.
             diag_keyboard_events(10000);
+        } else {
+            tpager::diag_display_set_stage(&g_display, "Stage: keyboard init failed");
         }
     }
 
     // Polling-first encoder diagnostics as agreed.
     diag_encoder_ticks(15000);
+    tpager::diag_display_set_stage(&g_display, "Stage: diag complete");
     ESP_LOGI(kTag, "===== T-PAGER DIAGNOSTIC COMPLETE =====");
 }
 

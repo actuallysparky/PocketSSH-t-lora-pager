@@ -5,9 +5,12 @@ if(TPAGER_DIAG)
     # Diagnostic firmware is intentionally minimal so hardware bring-up loops are fast.
     set(SOURCES
         "tpager_diag.cpp"
+        "tpager_display.cpp"
+        "tpager_sd.cpp"
         "tpager_xl9555.cpp"
         "tpager_tca8418.cpp"
         "tpager_encoder.cpp"
+        "esp_lcd_st7796.c"
     )
 else()
     set(SOURCES
@@ -35,7 +38,12 @@ set(INCLUDE_DIRS
 if(TPAGER_DIAG)
     set(REQUIRED_COMPONENTS
         driver
+        esp_lcd
+        esp_lvgl_port
+        lvgl
         esp_timer
+        fatfs
+        sdmmc
         nvs_flash
     )
 else()

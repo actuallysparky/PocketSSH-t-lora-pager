@@ -8,10 +8,11 @@
  * - Prefer polling-based input diagnostics first for robust early validation.
  */
 
-#include <array>
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -22,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "tpager_encoder.hpp"
 #include "tpager_tca8418.hpp"
 #include "tpager_xl9555.hpp"
 
@@ -51,6 +53,8 @@ constexpr TickType_t kI2CTimeoutTicks = ticks_from_ms(20);
 tpager::Xl9555 g_xl9555;
 tpager::Tca8418 g_tca8418;
 tpager::Tca8418State g_tca8418_state;
+std::vector<std::string> g_echo_history;
+constexpr size_t kMaxEchoHistory = 24;
 
 esp_err_t i2c_init()
 {
@@ -187,6 +191,17 @@ bool to_terminal_byte(const tpager::Tca8418Event &ev, uint8_t *out_byte)
     return false;
 }
 
+void push_echo_history(std::string line)
+{
+    if (line.empty()) {
+        return;
+    }
+    if (g_echo_history.size() >= kMaxEchoHistory) {
+        g_echo_history.erase(g_echo_history.begin());
+    }
+    g_echo_history.push_back(std::move(line));
+}
+
 void diag_keyboard_events(uint32_t sample_ms)
 {
     ESP_LOGI(kTag, "diag_keyboard_events: init matrix=4x10 (polling mode, IRQ pin=%d)", kKeyboardIrq);
@@ -253,6 +268,7 @@ void diag_keyboard_events(uint32_t sample_ms)
                         }
                     } else if (tx_byte == '\r') {
                         ESP_LOGI(kTag, "diag_keyboard_events: echo_submit=\"%s\"", echo_line.c_str());
+                        push_echo_history(echo_line);
                         echo_line.clear();
                     } else if (tx_byte >= 0x20 && tx_byte <= 0x7E) {
                         echo_line.push_back(static_cast<char>(tx_byte));
@@ -310,55 +326,42 @@ bool diag_keyboard_reset(uint8_t kb_power_pin)
     return false;
 }
 
-int8_t encoder_delta_from_transition(uint8_t prev_ab, uint8_t curr_ab)
-{
-    static constexpr std::array<int8_t, 16> lut = {
-        0, -1, 1, 0,
-        1, 0, 0, -1,
-        -1, 0, 0, 1,
-        0, 1, -1, 0,
-    };
-    return lut[(prev_ab << 2) | curr_ab];
-}
-
 void diag_encoder_ticks(uint32_t sample_ms)
 {
     ESP_LOGI(kTag, "diag_encoder_ticks: start (%" PRIu32 " ms)", sample_ms);
+    tpager::Encoder enc = {};
+    ESP_ERROR_CHECK(tpager::encoder_init(&enc, kEncoderA, kEncoderB, kEncoderCenter));
 
-    gpio_config_t cfg = {};
-    cfg.mode = GPIO_MODE_INPUT;
-    cfg.pull_up_en = GPIO_PULLUP_ENABLE;
-    cfg.pin_bit_mask = (1ULL << kEncoderA) | (1ULL << kEncoderB) | (1ULL << kEncoderCenter);
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-
-    auto read_ab = []() -> uint8_t {
-        uint8_t a = static_cast<uint8_t>(gpio_get_level(kEncoderA) ? 1 : 0);
-        uint8_t b = static_cast<uint8_t>(gpio_get_level(kEncoderB) ? 1 : 0);
-        return static_cast<uint8_t>((a << 1) | b);
-    };
-
-    uint8_t prev_ab = read_ab();
-    int prev_center = gpio_get_level(kEncoderCenter);
     int32_t net = 0;
     int32_t transitions = 0;
+    int32_t history_index = g_echo_history.empty() ? -1 : static_cast<int32_t>(g_echo_history.size() - 1);
 
     int64_t start_us = esp_timer_get_time();
     int64_t last_report_us = start_us;
     while ((esp_timer_get_time() - start_us) < static_cast<int64_t>(sample_ms) * 1000) {
-        uint8_t curr_ab = read_ab();
-        if (curr_ab != prev_ab) {
-            int8_t step = encoder_delta_from_transition(prev_ab, curr_ab);
-            if (step != 0) {
-                net += step;
-                ++transitions;
-            }
-            prev_ab = curr_ab;
-        }
+        tpager::EncoderEvent ev = {};
+        esp_err_t ret = tpager::encoder_poll(&enc, &ev);
+        if (ret == ESP_OK) {
+            transitions += ev.transitions;
+            if (ev.moved) {
+                net += ev.delta;
+                ESP_LOGI(kTag,
+                         "diag_encoder_ticks: delta=%" PRId32 ", net=%" PRId32 ", transitions=%" PRId32,
+                         ev.delta, net, transitions);
 
-        int center = gpio_get_level(kEncoderCenter);
-        if (center != prev_center) {
-            ESP_LOGI(kTag, "diag_encoder_ticks: center=%s", center ? "released" : "pressed");
-            prev_center = center;
+                // Contract: encoder movement should be visible in the same harness where keyboard submit logs lines.
+                if (!g_echo_history.empty()) {
+                    history_index = std::clamp(history_index - ev.delta, static_cast<int32_t>(0),
+                                               static_cast<int32_t>(g_echo_history.size() - 1));
+                    ESP_LOGI(kTag, "diag_encoder_ticks: history[%ld]=\"%s\"",
+                             static_cast<long>(history_index), g_echo_history[history_index].c_str());
+                }
+            }
+            if (ev.button_changed) {
+                ESP_LOGI(kTag, "diag_encoder_ticks: center=%s", ev.button_pressed ? "pressed" : "released");
+            }
+        } else if (ret != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(kTag, "diag_encoder_ticks: poll error: %s", esp_err_to_name(ret));
         }
 
         int64_t now_us = esp_timer_get_time();

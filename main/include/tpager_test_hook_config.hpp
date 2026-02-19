@@ -36,3 +36,7 @@
 #ifndef TPAGER_BOOT_SSH_MDNS_HOST
 #define TPAGER_BOOT_SSH_MDNS_HOST ""
 #endif
+
+#ifndef TPAGER_BOOT_SSH_KEYFILE
+#define TPAGER_BOOT_SSH_KEYFILE ""
+#endif

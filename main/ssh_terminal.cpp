@@ -288,16 +288,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Setting WIFI_CONNECTED_BIT in event group %p", s_wifi_event_group);
         EventBits_t result = xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "Event group bits after setting: 0x%x", result);
-        
-        if (terminal) {
-            char ip_str[64];
-            snprintf(ip_str, sizeof(ip_str), "WiFi Connected! IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
-            
-            if (display_lock(0)) {
-                terminal->append_text(ip_str);
-                display_unlock();
-            }
-        }
+        (void)terminal;
     }
 }
 
@@ -385,6 +376,8 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
             
             if (display_lock(0)) {
                 update_status_bar();
+                append_text("WiFi Connected\n");
+                print_sta_netinfo(this);
                 display_unlock();
             }
             return ESP_OK;
@@ -1312,7 +1305,13 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
     ssh_connected = true;
     update_status_bar();
 
-    xTaskCreate(ssh_receive_task, "ssh_rx", 8192, this, 5, NULL);
+    BaseType_t rx_task_ok = xTaskCreate(ssh_receive_task, "ssh_rx", 6144, this, 5, NULL);
+    if (rx_task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create SSH receive task");
+        append_text("ERROR: SSH receive task failed to start\n");
+        disconnect();
+        return ESP_FAIL;
+    }
 
     return ESP_OK;
 }
@@ -1444,7 +1443,13 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
     ssh_connected = true;
     update_status_bar();
 
-    xTaskCreate(ssh_receive_task, "ssh_rx", 8192, this, 5, NULL);
+    BaseType_t rx_task_ok = xTaskCreate(ssh_receive_task, "ssh_rx", 6144, this, 5, NULL);
+    if (rx_task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create SSH receive task");
+        append_text("ERROR: SSH receive task failed to start\n");
+        disconnect();
+        return ESP_FAIL;
+    }
 
     return ESP_OK;
 }
@@ -1588,7 +1593,7 @@ void SSHTerminal::send_command(const char* cmd)
     std::string full_cmd = std::string(cmd) + "\n";
     ssize_t nwritten = 0;
     int retry_count = 0;
-    const int MAX_RETRIES = 50;
+    const int MAX_RETRIES = 20;
     
     ESP_LOGI(TAG, "Sending command: %s", cmd);
     
@@ -1596,14 +1601,8 @@ void SSHTerminal::send_command(const char* cmd)
         ssize_t n = libssh2_channel_write(channel, full_cmd.c_str() + nwritten, 
                                           full_cmd.length() - nwritten);
         if (n == LIBSSH2_ERROR_EAGAIN) {
-            int wait_result = waitsocket(ssh_socket, session);
-            if (wait_result <= 0) {
-                retry_count++;
-                if (retry_count >= MAX_RETRIES) {
-                    ESP_LOGE(TAG, "Send command timeout after %d retries", retry_count);
-                    break;
-                }
-            }
+            retry_count++;
+            vTaskDelay(1);
             continue;
         }
         if (n < 0) {
@@ -1611,9 +1610,13 @@ void SSHTerminal::send_command(const char* cmd)
             break;
         }
         nwritten += n;
-        retry_count = 0;
+        retry_count = 0;  // Forward progress reset.
     }
     
+    if (nwritten < (ssize_t)full_cmd.length()) {
+        ESP_LOGW(TAG, "Command partially sent (%d/%d bytes)", (int)nwritten, (int)full_cmd.length());
+    }
+
     ESP_LOGI(TAG, "Command sent: %d bytes", (int)nwritten);
 }
 

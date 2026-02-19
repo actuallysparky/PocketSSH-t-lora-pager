@@ -60,6 +60,7 @@ constexpr int kBootSshPort = TPAGER_BOOT_SSH_PORT;
 constexpr const char *kBootSshUser = TPAGER_BOOT_SSH_USER;
 constexpr const char *kBootSshPassword = TPAGER_BOOT_SSH_PASSWORD;
 constexpr const char *kBootSshMdnsHost = TPAGER_BOOT_SSH_MDNS_HOST;
+constexpr const char *kBootSshKeyfile = TPAGER_BOOT_SSH_KEYFILE;
 
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
@@ -199,7 +200,7 @@ bool has_value(const char *s)
     return s != nullptr && s[0] != '\0';
 }
 
-void run_terminal_command(const char *cmd)
+void run_terminal_input(const char *cmd, bool submit)
 {
     if (cmd == nullptr) {
         return;
@@ -212,7 +213,14 @@ void run_terminal_command(const char *cmd)
         }
         vTaskDelay(ticks_from_ms(3));
     }
-    (void)inject_terminal_key('\n');
+    if (submit) {
+        (void)inject_terminal_key('\n');
+    }
+}
+
+void run_terminal_command(const char *cmd)
+{
+    run_terminal_input(cmd, true);
 }
 
 bool to_terminal_char(const tpager::Tca8418Event &ev, char *out_key)
@@ -424,16 +432,48 @@ void wifi_autoconnect_task(void *)
     vTaskDelay(ticks_from_ms(200));
 
     if (has_value(kBootSshHost) && has_value(kBootSshUser)) {
-        std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
-                      kBootSshHost, kBootSshPort, kBootSshUser, kBootSshPassword);
-        run_terminal_command(cmd);
-        vTaskDelay(ticks_from_ms(200));
+        if (has_value(kBootSshKeyfile)) {
+            std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
+                          kBootSshHost, kBootSshPort, kBootSshUser, kBootSshKeyfile);
+            run_terminal_command(cmd);
+            vTaskDelay(ticks_from_ms(250));
+            run_terminal_command("exit");
+            vTaskDelay(ticks_from_ms(200));
+            run_terminal_command("clear");
+            vTaskDelay(ticks_from_ms(120));
+        }
+
+        if (has_value(kBootSshPassword)) {
+            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
+                          kBootSshHost, kBootSshPort, kBootSshUser, kBootSshPassword);
+            run_terminal_command(cmd);
+            vTaskDelay(ticks_from_ms(200));
+        } else {
+            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s ",
+                          kBootSshHost, kBootSshPort, kBootSshUser);
+            append_terminal_text("Auto test: type password, then press Enter\n");
+            run_terminal_input(cmd, false);
+            vTaskDelete(nullptr);
+            return;
+        }
     }
 
     if (has_value(kBootSshMdnsHost) && has_value(kBootSshUser)) {
-        std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
-                      kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshPassword);
-        run_terminal_command(cmd);
+        if (has_value(kBootSshKeyfile)) {
+            std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
+                          kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshKeyfile);
+            run_terminal_command(cmd);
+            vTaskDelay(ticks_from_ms(250));
+            run_terminal_command("exit");
+            vTaskDelay(ticks_from_ms(200));
+            run_terminal_command("clear");
+            vTaskDelay(ticks_from_ms(120));
+        }
+        if (has_value(kBootSshPassword)) {
+            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
+                          kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshPassword);
+            run_terminal_command(cmd);
+        }
     }
     vTaskDelete(nullptr);
 }

@@ -3,6 +3,7 @@
 #include <cctype>
 
 #include "esp_check.h"
+#include "esp_timer.h"
 
 namespace {
 
@@ -17,6 +18,7 @@ constexpr uint8_t kRegKpGpio3 = 0x1F;
 constexpr uint8_t kCfgAi = 1U << 0;
 constexpr uint8_t kIntKey = 1U << 0;
 constexpr uint8_t kEventCountMask = 0x0F;
+constexpr int64_t kSpaceDebounceUs = 70000;
 
 // T-LoRa Pager keyboard map from LilyGo reference firmware.
 constexpr char kKeymap[4][10] = {
@@ -33,10 +35,12 @@ constexpr char kSymbolMap[4][10] = {
     {' ', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0', '\0'},
 };
 
-constexpr uint8_t kRawAlt = 0x14;
-constexpr uint8_t kRawCaps = 0x1C;
-constexpr uint8_t kRawBackspace = 0x1D;
-constexpr uint8_t kRawSymbol = 0x1E;
+// LilyGo keyboard special-key constants are based on the zero-based matrix key index
+// (raw TCA8418 code minus 1), not the raw FIFO code itself.
+constexpr uint8_t kKeyIndexAlt = 0x14;
+constexpr uint8_t kKeyIndexCaps = 0x1C;
+constexpr uint8_t kKeyIndexBackspace = 0x1D;
+constexpr uint8_t kKeyIndexSpace = 0x1E;
 
 esp_err_t tca_read_reg(const tpager::Tca8418 &dev, uint8_t reg, uint8_t *value)
 {
@@ -70,6 +74,19 @@ char key_from_maps(bool symbol, bool caps, uint8_t row, uint8_t col)
         ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     }
     return ch;
+}
+
+bool should_emit_space(tpager::Tca8418State *state)
+{
+    if (state == nullptr) {
+        return false;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - state->last_space_emit_us < kSpaceDebounceUs) {
+        return false;
+    }
+    state->last_space_emit_us = now_us;
+    return true;
 }
 
 }  // namespace
@@ -190,37 +207,53 @@ esp_err_t tca8418_poll_event(const Tca8418 &dev, Tca8418State *state, Tca8418Eve
     event->row = static_cast<uint8_t>(event->matrix_index / 10);
     event->col = static_cast<uint8_t>(event->matrix_index % 10);
 
+    // Contract: For this fork, ALT is the number/symbol chord modifier.
+    if (event->matrix_index == kKeyIndexAlt) {
+        if (event->pressed) {
+            state->symbol = true;
+            state->symbol_chord_used = false;
+            event->key = Tca8418Key::Alt;
+        } else {
+            event->key = Tca8418Key::Alt;
+            state->symbol = false;
+            state->symbol_chord_used = false;
+        }
+        return ESP_OK;
+    }
+
+    // Space is a dedicated key; debounce it and synthesize as press on release-only cases.
+    if (event->matrix_index == kKeyIndexSpace) {
+        event->key = Tca8418Key::Space;
+        event->ch = ' ';
+        if (should_emit_space(state)) {
+            event->pressed = true;
+        }
+        return ESP_OK;
+    }
+
     // Modifier handling follows reference firmware semantics (toggle on press).
     if (event->pressed) {
-        if (event->code == kRawAlt) {
-            state->alt = !state->alt;
-        } else if (event->code == kRawCaps) {
+        if (event->matrix_index == kKeyIndexCaps) {
             state->caps = !state->caps;
-        } else if (event->code == kRawSymbol) {
-            state->symbol = !state->symbol;
         }
     }
 
-    if (event->code == kRawAlt) {
-        event->key = Tca8418Key::Alt;
-        return ESP_OK;
-    }
-    if (event->code == kRawCaps) {
+    if (event->matrix_index == kKeyIndexCaps) {
         event->key = Tca8418Key::Caps;
         return ESP_OK;
     }
-    if (event->code == kRawSymbol) {
-        event->key = Tca8418Key::Symbol;
-        return ESP_OK;
-    }
-    if (event->code == kRawBackspace) {
+    if (event->matrix_index == kKeyIndexBackspace) {
         event->key = Tca8418Key::Backspace;
         event->ch = '\b';
         return ESP_OK;
     }
 
     if (event->row < dev.rows && event->col < dev.cols) {
-        event->ch = key_from_maps(state->symbol, state->caps, event->row, event->col);
+        const bool symbol_active = state->symbol;
+        event->ch = key_from_maps(symbol_active, state->caps, event->row, event->col);
+        if (symbol_active && event->pressed) {
+            state->symbol_chord_used = true;
+        }
         if (event->ch == '\n') {
             event->key = Tca8418Key::Enter;
         } else if (event->ch == ' ') {

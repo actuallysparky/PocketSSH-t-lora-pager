@@ -292,6 +292,9 @@ void poll_keyboard()
 
         char key = '\0';
         if (to_terminal_char(ev, &key)) {
+            if (ev.erase_previous_space) {
+                handle_terminal_key('\b');
+            }
             handle_terminal_key(key);
         }
     }
@@ -335,7 +338,9 @@ void runtime_task(void *)
     g_runtime_task_handle = xTaskGetCurrentTaskHandle();
 
     while (true) {
-        (void)ulTaskNotifyTake(pdTRUE, ticks_from_ms(25));
+        // Keep a short poll timeout so brief key taps (especially Space fallback)
+        // are handled with low latency even if IRQ edges are imperfect.
+        (void)ulTaskNotifyTake(pdTRUE, ticks_from_ms(10));
         poll_keyboard();
         poll_encoder();
     }

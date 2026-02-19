@@ -30,7 +30,13 @@ enum class Tca8418Key : uint8_t {
 struct Tca8418State {
     bool alt = false;
     bool caps = false;
+    // Contract: on T-Pager, symbol mode is a chord (Space + Key), not a sticky toggle.
     bool symbol = false;
+    bool symbol_chord_used = false;
+    bool symbol_pending_emit = false;
+    bool symbol_space_emitted = false;
+    int64_t symbol_pressed_us = 0;
+    int64_t last_space_emit_us = 0;
 };
 
 struct Tca8418Event {
@@ -44,6 +50,7 @@ struct Tca8418Event {
     uint8_t matrix_index = 0;
     Tca8418Key key = Tca8418Key::Unknown;
     char ch = '\0';
+    bool erase_previous_space = false;
 };
 
 esp_err_t tca8418_init(Tca8418 *dev, i2c_port_t port, uint8_t address, TickType_t timeout_ticks);

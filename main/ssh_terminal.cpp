@@ -20,6 +20,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/display.h"
 #include <cstring>
 #include <algorithm>
 #include <sys/socket.h>
@@ -29,6 +30,34 @@
 #include <sys/select.h>
 
 static const char *TAG = "SSH_TERMINAL";
+
+namespace {
+// Font fallback contract: keep UI readable even when smaller Montserrat faces
+// are disabled in sdkconfig/LVGL.
+const lv_font_t* ui_font_small()
+{
+#if defined(LV_FONT_MONTSERRAT_10) && LV_FONT_MONTSERRAT_10
+    return &lv_font_montserrat_10;
+#elif defined(LV_FONT_MONTSERRAT_12) && LV_FONT_MONTSERRAT_12
+    return &lv_font_montserrat_12;
+#elif defined(LV_FONT_MONTSERRAT_14) && LV_FONT_MONTSERRAT_14
+    return &lv_font_montserrat_14;
+#else
+    return LV_FONT_DEFAULT;
+#endif
+}
+
+const lv_font_t* ui_font_body()
+{
+#if defined(LV_FONT_MONTSERRAT_12) && LV_FONT_MONTSERRAT_12
+    return &lv_font_montserrat_12;
+#elif defined(LV_FONT_MONTSERRAT_14) && LV_FONT_MONTSERRAT_14
+    return &lv_font_montserrat_14;
+#else
+    return LV_FONT_DEFAULT;
+#endif
+}
+}  // namespace
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -270,13 +299,13 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     status_bar = lv_label_create(terminal_screen);
     lv_label_set_text(status_bar, "Status: Disconnected");
     lv_obj_set_style_text_color(status_bar, lv_color_hex(0x00FF00), 0);
-    lv_obj_set_style_text_font(status_bar, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(status_bar, ui_font_body(), 0);
     lv_obj_align(status_bar, LV_ALIGN_TOP_LEFT, 5, 5);
     
     byte_counter_label = lv_label_create(terminal_screen);
     lv_label_set_text(byte_counter_label, "0 B");
     lv_obj_set_style_text_color(byte_counter_label, lv_color_hex(0x00FFFF), 0);
-    lv_obj_set_style_text_font(byte_counter_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(byte_counter_label, ui_font_body(), 0);
     lv_obj_align(byte_counter_label, LV_ALIGN_TOP_RIGHT, -5, 5);
 
     terminal_output = lv_textarea_create(terminal_screen);
@@ -284,7 +313,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     lv_obj_align(terminal_output, LV_ALIGN_TOP_MID, 0, 25);
     lv_obj_set_style_bg_color(terminal_output, lv_color_black(), 0);
     lv_obj_set_style_text_color(terminal_output, lv_color_hex(0x00FF00), 0);
-    lv_obj_set_style_text_font(terminal_output, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(terminal_output, ui_font_small(), 0);
     lv_obj_set_style_border_color(terminal_output, lv_color_hex(0x00FF00), 0);
     lv_obj_set_style_border_width(terminal_output, 2, 0);
     lv_textarea_set_cursor_click_pos(terminal_output, false);
@@ -312,7 +341,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     input_label = lv_label_create(input_container);
     lv_label_set_text(input_label, "> ");
     lv_obj_set_style_text_color(input_label, lv_color_hex(0xFFFF00), 0);
-    lv_obj_set_style_text_font(input_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(input_label, ui_font_body(), 0);
     lv_label_set_long_mode(input_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(input_label, LV_ALIGN_LEFT_MID, 0, 0);
     
@@ -1547,7 +1576,7 @@ void SSHTerminal::create_side_panel()
     lv_obj_t* title = lv_label_create(side_panel);
     lv_label_set_text(title, "Keys");
     lv_obj_set_style_text_color(title, lv_color_hex(0x00FF00), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(title, ui_font_body(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
     
     auto create_key_button = [this](const char* label, const char* key_seq, int y_offset) {
@@ -1560,7 +1589,7 @@ void SSHTerminal::create_side_panel()
         lv_obj_t* btn_label = lv_label_create(btn);
         lv_label_set_text(btn_label, label);
         lv_obj_set_style_text_color(btn_label, lv_color_hex(0x00FF00), 0);
-        lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_font(btn_label, ui_font_small(), 0);
         lv_obj_center(btn_label);
         
         lv_obj_set_user_data(btn, (void*)key_seq);

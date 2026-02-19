@@ -19,8 +19,11 @@
 #include "driver/i2c.h"
 #include "esp_check.h"
 #include "esp_err.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -29,10 +32,6 @@
 #include "tpager_encoder.hpp"
 #include "tpager_sd.hpp"
 #include "tpager_tca8418.hpp"
-#if __has_include("tpager_test_hook_config_local.hpp")
-#include "tpager_test_hook_config_local.hpp"
-#endif
-#include "tpager_test_hook_config.hpp"
 #include "tpager_xl9555.hpp"
 
 namespace {
@@ -50,11 +49,8 @@ constexpr gpio_num_t kKeyboardIrq = GPIO_NUM_6;
 constexpr gpio_num_t kEncoderA = GPIO_NUM_40;
 constexpr gpio_num_t kEncoderB = GPIO_NUM_41;
 constexpr gpio_num_t kEncoderCenter = GPIO_NUM_7;
-
-// Boot test hook credentials are loaded from local gitignored overrides.
-constexpr bool kBootAutoTestHook = (TPAGER_BOOT_TEST_ENABLE != 0);
-constexpr const char *kBootWifiSsid = TPAGER_BOOT_WIFI_SSID;
-constexpr const char *kBootWifiPassword = TPAGER_BOOT_WIFI_PASSWORD;
+constexpr gpio_num_t kBootButton = GPIO_NUM_0;
+constexpr gpio_num_t kDisplayBacklight = GPIO_NUM_42;
 
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
@@ -83,6 +79,9 @@ int32_t g_keyboard_presses = 0;
 int32_t g_keyboard_releases = 0;
 int32_t g_encoder_net = 0;
 int32_t g_encoder_transitions = 0;
+bool g_shutdown_requested = false;
+bool g_alt_held = false;
+bool g_caps_held = false;
 
 void IRAM_ATTR keyboard_irq_isr(void *)
 {
@@ -167,54 +166,6 @@ void handle_terminal_key(char key)
     }
     g_terminal->handle_key_input(key);
     lvgl_port_unlock();
-}
-
-bool inject_terminal_key(char key)
-{
-    if (g_terminal == nullptr) {
-        return false;
-    }
-
-    constexpr int kAttempts = 40;
-    for (int attempt = 0; attempt < kAttempts; ++attempt) {
-        if (lvgl_port_lock(25)) {
-            g_terminal->handle_key_input(key);
-            lvgl_port_unlock();
-            return true;
-        }
-        vTaskDelay(ticks_from_ms(5));
-    }
-
-    ESP_LOGW(kTag, "Auto command key injection failed: 0x%02x", static_cast<unsigned char>(key));
-    return false;
-}
-
-bool has_value(const char *s)
-{
-    return s != nullptr && s[0] != '\0';
-}
-
-void run_terminal_input(const char *cmd, bool submit)
-{
-    if (cmd == nullptr) {
-        return;
-    }
-
-    ESP_LOGI(kTag, "Auto command: %s", cmd);
-    for (const char *p = cmd; *p != '\0'; ++p) {
-        if (!inject_terminal_key(*p)) {
-            break;
-        }
-        vTaskDelay(ticks_from_ms(3));
-    }
-    if (submit) {
-        (void)inject_terminal_key('\n');
-    }
-}
-
-void run_terminal_command(const char *cmd)
-{
-    run_terminal_input(cmd, true);
 }
 
 bool to_terminal_char(const tpager::Tca8418Event &ev, char *out_key)
@@ -340,6 +291,12 @@ void poll_keyboard()
             break;
         }
 
+        if (ev.key == tpager::Tca8418Key::Alt) {
+            g_alt_held = ev.pressed;
+        } else if (ev.key == tpager::Tca8418Key::Caps) {
+            g_caps_held = ev.pressed;
+        }
+
         g_keyboard_events++;
         if (ev.pressed) {
             g_keyboard_presses++;
@@ -372,12 +329,33 @@ void poll_encoder()
         g_encoder_net += ev.delta;
         if (g_terminal != nullptr && lvgl_port_lock(25)) {
             int32_t steps = ev.delta;
+
+            // Encoder interaction contract:
+            // - default      : command history
+            // - ALT + encoder: cursor left/right on input line
+            // - CAPS + encoder: terminal output scroll up/down
+            // CAPS mode has priority if both modifiers are held.
+            const bool scroll_mode = g_caps_held;
+            const bool cursor_mode = !scroll_mode && g_alt_held;
+
             while (steps > 0) {
-                g_terminal->navigate_history(1);
+                if (scroll_mode) {
+                    g_terminal->scroll_terminal_output(-1);
+                } else if (cursor_mode) {
+                    g_terminal->move_cursor_right();
+                } else {
+                    g_terminal->navigate_history(1);
+                }
                 steps--;
             }
             while (steps < 0) {
-                g_terminal->navigate_history(-1);
+                if (scroll_mode) {
+                    g_terminal->scroll_terminal_output(1);
+                } else if (cursor_mode) {
+                    g_terminal->move_cursor_left();
+                } else {
+                    g_terminal->navigate_history(-1);
+                }
                 steps++;
             }
             lvgl_port_unlock();
@@ -403,31 +381,71 @@ void runtime_task(void *)
     }
 }
 
-void wifi_autoconnect_task(void *)
+void shutdown_task(void *)
 {
-    if (!kBootAutoTestHook || g_terminal == nullptr) {
-        vTaskDelete(nullptr);
-        return;
-    }
-    if (!has_value(kBootWifiSsid) || !has_value(kBootWifiPassword)) {
-        ESP_LOGW(kTag, "Boot test hook enabled without WiFi credentials");
-        append_terminal_text("Auto test hook disabled: missing WiFi credentials\n");
-        vTaskDelete(nullptr);
-        return;
+    append_terminal_text("Powering down...\n");
+    ESP_LOGW(kTag, "Shutdown requested: entering deep sleep");
+
+    // Stop IRQ traffic while we wind down.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_intr_disable(kKeyboardIrq));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_remove(kKeyboardIrq));
+
+    // Best-effort comms quiesce.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
+
+    // Turn display backlight off.
+    gpio_reset_pin(kDisplayBacklight);
+    gpio_set_direction(kDisplayBacklight, GPIO_MODE_OUTPUT);
+    gpio_set_level(kDisplayBacklight, 0);
+
+    // Power-gate peripherals controlled via expander.
+    if (tpager::xl9555_probe(g_xl9555) == ESP_OK) {
+        (void)tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, true);
+        (void)tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_KB_RESET, true);
+        (void)tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_KB_POWER_EN_PRIMARY, true);
+        (void)tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_KB_POWER_EN_FALLBACK, true);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, false));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_KB_RESET, false));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_KB_POWER_EN_PRIMARY, false));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_KB_POWER_EN_FALLBACK, false));
     }
 
-    vTaskDelay(ticks_from_ms(700));
-    append_terminal_text("Auto test hook start\n");
-    char cmd[192];
-    std::snprintf(cmd, sizeof(cmd), "connect %s %s", kBootWifiSsid, kBootWifiPassword);
-    run_terminal_command(cmd);
-    vTaskDelay(ticks_from_ms(200));
-    run_terminal_command("netinfo");
-    append_terminal_text("Auto test hook complete (WiFi only)\n");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
+
+    // Wake sources: BOOT key or encoder center press.
+    gpio_config_t wake_cfg = {};
+    wake_cfg.mode = GPIO_MODE_INPUT;
+    wake_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    wake_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    wake_cfg.pin_bit_mask = (1ULL << kBootButton) | (1ULL << kEncoderCenter);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&wake_cfg));
+
+    const uint64_t wake_mask = (1ULL << kBootButton) | (1ULL << kEncoderCenter);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW));
+#else
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW));
+#endif
+
+    vTaskDelay(ticks_from_ms(150));
+    esp_deep_sleep_start();
     vTaskDelete(nullptr);
 }
 
 }  // namespace
+
+extern "C" void tpager_request_shutdown(void)
+{
+    if (g_shutdown_requested) {
+        return;
+    }
+    g_shutdown_requested = true;
+    xTaskCreatePinnedToCore(shutdown_task, "tpager_shutdown_task", 6144, nullptr, 6, nullptr, 1);
+}
 
 extern "C" void app_main(void)
 {
@@ -506,10 +524,6 @@ extern "C" void app_main(void)
     }
 
     load_ssh_keys_from_sd();
-
-    if (kBootAutoTestHook) {
-        xTaskCreatePinnedToCore(wifi_autoconnect_task, "tpager_wifi_auto_task", 6144, nullptr, 4, nullptr, 1);
-    }
 
     xTaskCreatePinnedToCore(runtime_task, "tpager_runtime_task", 8192, nullptr, 5, nullptr, 1);
 

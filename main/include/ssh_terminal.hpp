@@ -43,6 +43,7 @@ public:
     void move_cursor_right();
     void move_cursor_home();
     void move_cursor_end();
+    void scroll_terminal_output(int steps);
     
     esp_err_t init_wifi(const char* ssid, const char* password);
     bool is_wifi_connected();
@@ -96,6 +97,24 @@ private:
     
     // SSH key storage: keyname -> key content
     std::map<std::string, std::string> loaded_keys;
+
+    // Connection context shown in the status bar.
+    std::string connected_wifi_ssid;
+    std::string connected_ssh_host;
+
+    // Terminal font mode contract:
+    // - false: compact mode (~67x13)
+    // - true : larger mode (~53x9)
+    bool terminal_font_big;
+
+    // Touch scrubbing state for left/right cursor drag on the input line.
+    bool touch_scrub_active;
+    bool touch_scrub_moved;
+    bool touch_scrub_axis_locked;
+    bool touch_scrub_vertical_mode;
+    int32_t touch_scrub_last_x;
+    int32_t touch_scrub_last_y;
+    int32_t touch_scrub_accum_x;
     
     void update_terminal_display();
     void update_input_display();
@@ -116,6 +135,10 @@ private:
     static void battery_update_cb(lv_timer_t* timer);
     static void history_save_cb(lv_timer_t* timer);
     static void ssh_receive_task(void* param);
+
+    void apply_terminal_font_mode();
+    void set_terminal_font_mode(bool big_mode, bool announce);
+    void load_default_terminal_font_mode_from_config();
     
     static int waitsocket(int socket_fd, LIBSSH2_SESSION *session);
     esp_err_t ssh_authenticate(const char* username, const char* password);

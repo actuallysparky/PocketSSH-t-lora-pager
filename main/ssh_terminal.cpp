@@ -46,6 +46,10 @@
 
 static const char *TAG = "SSH_TERMINAL";
 
+#if defined(TPAGER_TARGET)
+extern "C" void tpager_request_shutdown(void);
+#endif
+
 namespace {
 // Font fallback contract: keep UI readable even when smaller Montserrat faces
 // are disabled in sdkconfig/LVGL.
@@ -88,6 +92,17 @@ const lv_font_t* ui_font_body()
     return &lv_font_montserrat_14;
 #else
     return LV_FONT_DEFAULT;
+#endif
+}
+
+const lv_font_t* ui_font_terminal_big()
+{
+#if defined(LV_FONT_MONTSERRAT_14) && LV_FONT_MONTSERRAT_14
+    return &lv_font_montserrat_14;
+#elif defined(LV_FONT_MONTSERRAT_12) && LV_FONT_MONTSERRAT_12
+    return &lv_font_montserrat_12;
+#else
+    return ui_font_body();
 #endif
 }
 
@@ -145,8 +160,11 @@ private:
 #endif
 
 constexpr const char *kSshConfigPath = "/sdcard/ssh_keys/ssh_config";
+constexpr const char *kSshConfigPathRoot = "/sdcard/ssh_config";
 constexpr const char *kSshKeysRoot = "/sdcard/ssh_keys/";
 constexpr const char *kSshKeysDir = "/sdcard/ssh_keys";
+constexpr const char *kWifiConfigPath = "/sdcard/ssh_keys/wifi_config";
+constexpr const char *kWifiConfigPathRoot = "/sdcard/wifi_config";
 
 struct SSHConfigOptions {
     bool has_host_name = false;
@@ -176,6 +194,9 @@ struct SSHConfigOptions {
 
     bool has_network = false;
     std::string network;
+
+    bool has_fontsize = false;
+    bool fontsize_big = false;
 };
 
 struct SSHConfigHostBlock {
@@ -200,6 +221,29 @@ struct ResolvedSSHConfig {
     std::string strict_host_key_checking = "ask";
     std::string network;
 };
+
+struct WifiProfile {
+    std::string network_name;
+    std::string ssid;
+    std::string password;
+    bool auto_connect = false;
+    bool has_auto_connect = false;
+    int file_order = 0;
+};
+
+std::string abbreviate_status_value(const std::string &value, size_t max_len)
+{
+    if (max_len == 0) {
+        return "";
+    }
+    if (value.size() <= max_len) {
+        return value;
+    }
+    if (max_len <= 3) {
+        return value.substr(0, max_len);
+    }
+    return value.substr(0, max_len - 3) + "...";
+}
 
 bool resolve_host_ipv4(const char *host, int port, struct sockaddr_in *out_addr)
 {
@@ -360,6 +404,14 @@ std::string trim_matching_quotes(const std::string &value)
     return value;
 }
 
+bool starts_with_ascii_ci(const std::string &value, const std::string &prefix)
+{
+    if (value.size() < prefix.size()) {
+        return false;
+    }
+    return lowercase_ascii(value.substr(0, prefix.size())) == lowercase_ascii(prefix);
+}
+
 bool split_directive(const std::string &line, std::string *key, std::string *value)
 {
     if (key == nullptr || value == nullptr) {
@@ -415,6 +467,24 @@ bool parse_bool_flag(const std::string &value, bool *out)
     }
     if (lowered == "no" || lowered == "false" || lowered == "off" || lowered == "0") {
         *out = false;
+        return true;
+    }
+    return false;
+}
+
+bool parse_fontsize_token(const std::string &value, bool *out_big)
+{
+    if (out_big == nullptr) {
+        return false;
+    }
+
+    const std::string lowered = lowercase_ascii(trim_ascii(value));
+    if (lowered == "big" || lowered == "large") {
+        *out_big = true;
+        return true;
+    }
+    if (lowered == "normal" || lowered == "small") {
+        *out_big = false;
         return true;
     }
     return false;
@@ -585,6 +655,14 @@ void apply_option(const std::string &directive, const std::string &raw_value, SS
         target->has_network = true;
         return;
     }
+    if (directive == "fontsize") {
+        bool parsed_big = false;
+        if (parse_fontsize_token(value, &parsed_big)) {
+            target->fontsize_big = parsed_big;
+            target->has_fontsize = true;
+        }
+        return;
+    }
 }
 
 void merge_options(const SSHConfigOptions &source, SSHConfigOptions *target)
@@ -634,6 +712,10 @@ void merge_options(const SSHConfigOptions &source, SSHConfigOptions *target)
         target->network = source.network;
         target->has_network = true;
     }
+    if (source.has_fontsize) {
+        target->fontsize_big = source.fontsize_big;
+        target->has_fontsize = true;
+    }
 }
 
 bool path_exists_regular_file(const std::string &path)
@@ -648,45 +730,392 @@ bool path_exists_regular_file(const std::string &path)
 std::string resolve_ssh_config_path()
 {
     const std::string preferred = kSshConfigPath;
-    if (path_exists_regular_file(preferred)) {
+    const std::string root_preferred = kSshConfigPathRoot;
+
+    auto candidate_score = [](const std::string &lower_name) -> int {
+        if (lower_name == "ssh_config") {
+            return 100;
+        }
+        if (starts_with_ascii_ci(lower_name, "ssh_config")) {
+            return 95;
+        }
+        if (starts_with_ascii_ci(lower_name, "ssh_co~") ||
+            starts_with_ascii_ci(lower_name, "ssh_c~") ||
+            starts_with_ascii_ci(lower_name, "sshco~") ||
+            starts_with_ascii_ci(lower_name, "sshc~")) {
+            return 90;
+        }
+        if (lower_name == "sshcfg" || lower_name == "ssh.cfg" || lower_name == "ssh_cfg") {
+            return 80;
+        }
+        if (starts_with_ascii_ci(lower_name, "sshcfg") || starts_with_ascii_ci(lower_name, "ssh_cfg")) {
+            return 70;
+        }
+        if (lower_name.find("ssh") != std::string::npos && lower_name.find("config") != std::string::npos) {
+            return 60;
+        }
+        if (starts_with_ascii_ci(lower_name, "ssh") && lower_name.find('~') != std::string::npos) {
+            return 55;
+        }
+        return 0;
+    };
+
+    auto tilde_index = [](const std::string &name) -> int {
+        const size_t tilde = name.find('~');
+        if (tilde == std::string::npos || tilde + 1 >= name.size()) {
+            return -1;
+        }
+        int value = 0;
+        bool saw_digit = false;
+        for (size_t i = tilde + 1; i < name.size(); ++i) {
+            const char ch = name[i];
+            if (ch >= '0' && ch <= '9') {
+                saw_digit = true;
+                value = value * 10 + (ch - '0');
+            } else {
+                break;
+            }
+        }
+        return saw_digit ? value : -1;
+    };
+
+    struct SSHConfigCandidate {
+        std::string path;
+        std::string lower_name;
+        int score = 0;
+        int tilde = -1;
+        time_t mtime = 0;
+        int dir_rank = 0;
+    };
+
+    auto scan_dir = [&](const char *dir_path, int dir_rank, std::vector<SSHConfigCandidate> *out) {
+        if (dir_path == nullptr || out == nullptr) {
+            return;
+        }
+        DIR *dir = opendir(dir_path);
+        if (dir == nullptr) {
+            ESP_LOGW(TAG, "ssh_config resolve: unable to open %s (errno=%d %s)",
+                     dir_path, errno, strerror(errno));
+            return;
+        }
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            const std::string lower = lowercase_ascii(name);
+            const int score = candidate_score(lower);
+            if (score <= 0) {
+                continue;
+            }
+
+            const std::string path = std::string(dir_path) + "/" + name;
+            struct stat st = {};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+
+            SSHConfigCandidate candidate = {};
+            candidate.path = path;
+            candidate.lower_name = lower;
+            candidate.score = score;
+            candidate.tilde = tilde_index(name);
+            candidate.mtime = st.st_mtime;
+            candidate.dir_rank = dir_rank;
+            out->push_back(candidate);
+        }
+        closedir(dir);
+    };
+
+    std::vector<SSHConfigCandidate> candidates;
+    scan_dir(kSshKeysDir, 1, &candidates);
+    scan_dir("/sdcard", 0, &candidates);
+
+    if (candidates.empty()) {
+        ESP_LOGW(TAG, "ssh_config resolve: no candidate in %s or /sdcard; expected %s or %s",
+                 kSshKeysDir, preferred.c_str(), root_preferred.c_str());
         return preferred;
     }
 
-    DIR *dir = opendir(kSshKeysDir);
-    if (dir == nullptr) {
-        ESP_LOGW(TAG, "ssh_config resolve: unable to open %s (errno=%d %s)",
-                 kSshKeysDir, errno, strerror(errno));
+    const SSHConfigCandidate *best = &candidates[0];
+    for (const auto &candidate : candidates) {
+        bool take = false;
+        if (candidate.mtime > best->mtime) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score > best->score) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde > best->tilde) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde == best->tilde && candidate.dir_rank > best->dir_rank) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde == best->tilde && candidate.dir_rank == best->dir_rank &&
+                   candidate.lower_name > best->lower_name) {
+            take = true;
+        }
+        if (take) {
+            best = &candidate;
+        }
+    }
+
+    ESP_LOGW(TAG, "ssh_config resolve: selected %s (score=%d mtime=%" PRId64 " tilde=%d)",
+             best->path.c_str(), best->score, static_cast<int64_t>(best->mtime), best->tilde);
+    return best->path;
+}
+
+std::string resolve_wifi_config_path()
+{
+    const std::string preferred = kWifiConfigPath;
+    const std::string root_preferred = kWifiConfigPathRoot;
+
+    auto candidate_score = [](const std::string &lower_name) -> int {
+        if (lower_name == "wifi_config") {
+            return 100;
+        }
+        if (starts_with_ascii_ci(lower_name, "wifi_config")) {
+            return 95;
+        }
+        if (starts_with_ascii_ci(lower_name, "wifi_co~") ||
+            starts_with_ascii_ci(lower_name, "wifi_c~") ||
+            starts_with_ascii_ci(lower_name, "wifico~") ||
+            starts_with_ascii_ci(lower_name, "wific~")) {
+            return 90;
+        }
+        if (lower_name == "wificfg" || lower_name == "wifi.cfg" || lower_name == "wifi_cfg") {
+            return 80;
+        }
+        if (starts_with_ascii_ci(lower_name, "wificfg") || starts_with_ascii_ci(lower_name, "wifi_cfg")) {
+            return 70;
+        }
+        if (starts_with_ascii_ci(lower_name, "wifi") && lower_name.find('~') != std::string::npos) {
+            return 60;
+        }
+        return 0;
+    };
+
+    auto tilde_index = [](const std::string &name) -> int {
+        const size_t tilde = name.find('~');
+        if (tilde == std::string::npos || tilde + 1 >= name.size()) {
+            return -1;
+        }
+        int value = 0;
+        bool saw_digit = false;
+        for (size_t i = tilde + 1; i < name.size(); ++i) {
+            const char ch = name[i];
+            if (ch >= '0' && ch <= '9') {
+                saw_digit = true;
+                value = value * 10 + (ch - '0');
+            } else {
+                break;
+            }
+        }
+        return saw_digit ? value : -1;
+    };
+
+    struct WifiConfigCandidate {
+        std::string path;
+        std::string lower_name;
+        int score = 0;
+        int tilde = -1;
+        time_t mtime = 0;
+        int dir_rank = 0;
+    };
+
+    auto scan_dir = [&](const char *dir_path, int dir_rank, std::vector<WifiConfigCandidate> *out) {
+        if (dir_path == nullptr || out == nullptr) {
+            return;
+        }
+        DIR *dir = opendir(dir_path);
+        if (dir == nullptr) {
+            ESP_LOGW(TAG, "wifi_config resolve: unable to open %s (errno=%d %s)",
+                     dir_path, errno, strerror(errno));
+            return;
+        }
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            const std::string lower = lowercase_ascii(name);
+            const int score = candidate_score(lower);
+            if (score <= 0) {
+                continue;
+            }
+
+            const std::string path = std::string(dir_path) + "/" + name;
+            struct stat st = {};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+
+            WifiConfigCandidate candidate = {};
+            candidate.path = path;
+            candidate.lower_name = lower;
+            candidate.score = score;
+            candidate.tilde = tilde_index(name);
+            candidate.mtime = st.st_mtime;
+            candidate.dir_rank = dir_rank;
+            out->push_back(candidate);
+        }
+        closedir(dir);
+    };
+
+    std::vector<WifiConfigCandidate> candidates;
+    scan_dir(kSshKeysDir, 1, &candidates);
+    scan_dir("/sdcard", 0, &candidates);
+
+    if (candidates.empty()) {
+        ESP_LOGW(TAG, "wifi_config resolve: no candidate in %s or /sdcard; expected %s or %s",
+                 kSshKeysDir, preferred.c_str(), root_preferred.c_str());
         return preferred;
     }
 
-    std::string best_match;
-    struct dirent *entry = nullptr;
-    while ((entry = readdir(dir)) != nullptr) {
-        const std::string name = entry->d_name;
-        if (name == "." || name == "..") {
+    const WifiConfigCandidate *best = &candidates[0];
+    for (const auto &candidate : candidates) {
+        bool take = false;
+        if (candidate.mtime > best->mtime) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score > best->score) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde > best->tilde) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde == best->tilde && candidate.dir_rank > best->dir_rank) {
+            take = true;
+        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+                   candidate.tilde == best->tilde && candidate.dir_rank == best->dir_rank &&
+                   candidate.lower_name > best->lower_name) {
+            take = true;
+        }
+        if (take) {
+            best = &candidate;
+        }
+    }
+
+    ESP_LOGW(TAG, "wifi_config resolve: selected %s (score=%d mtime=%" PRId64 " tilde=%d)",
+             best->path.c_str(), best->score, static_cast<int64_t>(best->mtime), best->tilde);
+    return best->path;
+}
+
+void maybe_push_wifi_profile(const WifiProfile &candidate, std::vector<WifiProfile> *profiles)
+{
+    if (profiles == nullptr) {
+        return;
+    }
+    // Accept either named profile or direct SSID profile; runtime command matching
+    // supports both `wifi <NetworkName>` and `wifi <SSID>`.
+    if (candidate.network_name.empty() && candidate.ssid.empty()) {
+        return;
+    }
+    profiles->push_back(candidate);
+}
+
+bool parse_wifi_config_file(std::vector<WifiProfile> *profiles)
+{
+    if (profiles == nullptr) {
+        return false;
+    }
+    profiles->clear();
+
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        return false;
+    }
+#endif
+
+    const std::string config_path = resolve_wifi_config_path();
+    FILE *file = std::fopen(config_path.c_str(), "r");
+    if (file == nullptr) {
+        ESP_LOGW(TAG, "wifi_config open failed: %s (errno=%d %s)",
+                 config_path.c_str(), errno, strerror(errno));
+        return false;
+    }
+    ESP_LOGI(TAG, "wifi_config open: %s", config_path.c_str());
+
+    WifiProfile current = {};
+    bool in_profile = false;
+    int order = 0;
+    char line_buffer[512];
+    while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
+        std::string line = line_buffer;
+        line = trim_ascii(strip_inline_comment(line));
+        if (line.empty()) {
             continue;
         }
-        const std::string lower = lowercase_ascii(name);
-        if (lower == "ssh_config") {
-            best_match = std::string(kSshKeysDir) + "/" + name;
-            break;
+
+        std::string key;
+        std::string value;
+        if (!split_directive(line, &key, &value)) {
+            continue;
         }
-        if (lower.rfind("ssh_config", 0) == 0 ||
-            lower.rfind("ssh_co~", 0) == 0 ||
-            lower.rfind("sshcon", 0) == 0) {
-            best_match = std::string(kSshKeysDir) + "/" + name;
+
+        const std::string directive = lowercase_ascii(key);
+        const std::string cleaned_value = trim_matching_quotes(trim_ascii(value));
+        if (directive == "network") {
+            if (in_profile) {
+                maybe_push_wifi_profile(current, profiles);
+            }
+            current = {};
+            current.network_name = cleaned_value;
+            current.file_order = order++;
+            in_profile = true;
+            continue;
+        }
+
+        if (!in_profile) {
+            // Tolerate top-level keys by implicitly creating a profile.
+            current = {};
+            current.file_order = order++;
+            in_profile = true;
+        }
+
+        if (directive == "ssid") {
+            current.ssid = cleaned_value;
+        } else if (directive == "password") {
+            current.password = cleaned_value;
+        } else if (directive == "autoconnect") {
+            bool parsed = false;
+            if (parse_bool_flag(cleaned_value, &parsed)) {
+                current.auto_connect = parsed;
+                current.has_auto_connect = true;
+            }
+        } else if (directive == "priority") {
+            // Accepted for compatibility with requirement doc; currently unused.
         }
     }
-    closedir(dir);
 
-    if (!best_match.empty()) {
-        ESP_LOGW(TAG, "ssh_config resolve: using fallback path %s", best_match.c_str());
-        return best_match;
+    if (in_profile) {
+        maybe_push_wifi_profile(current, profiles);
     }
 
-    ESP_LOGW(TAG, "ssh_config resolve: no candidate in %s, expected %s",
-             kSshKeysDir, preferred.c_str());
-    return preferred;
+    std::fclose(file);
+    return true;
+}
+
+const WifiProfile *find_wifi_profile(const std::vector<WifiProfile> &profiles, const std::string &name_or_ssid)
+{
+    const std::string query = lowercase_ascii(trim_ascii(name_or_ssid));
+    if (query.empty()) {
+        return nullptr;
+    }
+
+    for (const auto &profile : profiles) {
+        if (!profile.network_name.empty() && lowercase_ascii(profile.network_name) == query) {
+            return &profile;
+        }
+    }
+    for (const auto &profile : profiles) {
+        if (!profile.ssid.empty() && lowercase_ascii(profile.ssid) == query) {
+            return &profile;
+        }
+    }
+    return nullptr;
 }
 
 bool parse_ssh_config_file(SSHConfigFile *parsed)
@@ -803,6 +1232,24 @@ bool resolve_ssh_alias(const std::string &alias, ResolvedSSHConfig *resolved)
                                              ? effective.strict_host_key_checking
                                              : "ask";
     resolved->network = effective.has_network ? effective.network : "";
+    return true;
+}
+
+bool read_default_fontsize_big_from_config(bool *out_big)
+{
+    if (out_big == nullptr) {
+        return false;
+    }
+
+    SSHConfigFile parsed = {};
+    if (!parse_ssh_config_file(&parsed)) {
+        return false;
+    }
+    if (!parsed.global_options.has_fontsize) {
+        return false;
+    }
+
+    *out_big = parsed.global_options.fontsize_big;
     return true;
 }
 
@@ -927,38 +1374,91 @@ const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
     return nullptr;
 }
 
-void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
+esp_err_t connect_wifi_profile(SSHTerminal *terminal, const WifiProfile &profile, const char *context)
 {
-    if (terminal == nullptr || alias.empty()) {
-        return;
+    if (terminal == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (profile.ssid.empty()) {
+        terminal->append_text("ERROR: wifi_config profile missing SSID\n");
+        return ESP_FAIL;
     }
 
-    ResolvedSSHConfig resolved = {};
-    if (!resolve_ssh_alias(alias, &resolved)) {
-        terminal->append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
-        terminal->append_text("Hint: run 'hosts' to list available aliases.\n");
-        return;
+    if (context != nullptr && context[0] != '\0') {
+        terminal->append_text(context);
+        terminal->append_text("\n");
     }
 
-    if (!terminal->is_wifi_connected()) {
-        terminal->append_text("ERROR: WiFi not connected\n");
-        terminal->append_text("Use: connect <SSID> <PASSWORD>\n");
-        return;
+    terminal->append_text("WiFi profile connect: ");
+    if (!profile.network_name.empty()) {
+        terminal->append_text(profile.network_name.c_str());
+        terminal->append_text(" -> ");
+    }
+    terminal->append_text(profile.ssid.c_str());
+    terminal->append_text("\n");
+
+    return terminal->init_wifi(profile.ssid.c_str(), profile.password.c_str());
+}
+
+bool auto_connect_wifi_profiles(SSHTerminal *terminal)
+{
+    if (terminal == nullptr) {
+        return false;
     }
 
-    if (resolved.user.empty()) {
-        terminal->append_text("ERROR: ssh_config alias missing User directive\n");
-        return;
+    std::vector<WifiProfile> profiles;
+    if (!parse_wifi_config_file(&profiles)) {
+        terminal->append_text("wifi auto: no wifi_config found (/sdcard/ssh_keys/wifi_config or /sdcard/wifi_config)\n");
+        return false;
     }
 
-    char resolved_line[196];
-    std::snprintf(resolved_line, sizeof(resolved_line),
-                  "Resolved %s -> %s:%d as %s\n",
-                  resolved.alias.c_str(),
-                  resolved.host_name.c_str(),
-                  resolved.port,
-                  resolved.user.c_str());
-    terminal->append_text(resolved_line);
+    bool attempted = false;
+    for (const auto &profile : profiles) {
+        if (!profile.has_auto_connect || !profile.auto_connect) {
+            continue;
+        }
+        attempted = true;
+        if (connect_wifi_profile(terminal, profile, "wifi auto: trying profile") == ESP_OK) {
+            terminal->append_text("wifi auto: connected\n");
+            return true;
+        }
+        terminal->append_text("wifi auto: failed, trying next profile\n");
+    }
+
+    if (!attempted) {
+        terminal->append_text("wifi auto: no AutoConnect true profiles\n");
+    }
+    return false;
+}
+
+bool connect_wifi_profile_by_name_or_ssid(SSHTerminal *terminal, const std::string &name_or_ssid)
+{
+    if (terminal == nullptr) {
+        return false;
+    }
+
+    std::vector<WifiProfile> profiles;
+    if (!parse_wifi_config_file(&profiles)) {
+        terminal->append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config or /sdcard/wifi_config\n");
+        return false;
+    }
+
+    const WifiProfile *profile = find_wifi_profile(profiles, name_or_ssid);
+    if (profile == nullptr) {
+        terminal->append_text("No matching wifi profile for: ");
+        terminal->append_text(name_or_ssid.c_str());
+        terminal->append_text("\n");
+        return false;
+    }
+
+    return connect_wifi_profile(terminal, *profile, nullptr) == ESP_OK;
+}
+
+bool connect_with_alias_identities(SSHTerminal *terminal, const ResolvedSSHConfig &resolved)
+{
+    if (terminal == nullptr) {
+        return false;
+    }
 
     bool attempted_identity = false;
     bool connected = false;
@@ -1011,6 +1511,63 @@ void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
             terminal->append_text("Add IdentityFile in ssh_config or use ssh/sshkey command directly.\n");
         } else {
             terminal->append_text("ERROR: All configured identity files failed\n");
+        }
+    }
+
+    return connected;
+}
+
+void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
+{
+    if (terminal == nullptr || alias.empty()) {
+        return;
+    }
+
+    ResolvedSSHConfig resolved = {};
+    if (!resolve_ssh_alias(alias, &resolved)) {
+        terminal->append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
+        terminal->append_text("Hint: run 'hosts' to list available aliases.\n");
+        return;
+    }
+
+    if (resolved.user.empty()) {
+        terminal->append_text("ERROR: ssh_config alias missing User directive\n");
+        return;
+    }
+
+    char resolved_line[196];
+    std::snprintf(resolved_line, sizeof(resolved_line),
+                  "Resolved %s -> %s:%d as %s\n",
+                  resolved.alias.c_str(),
+                  resolved.host_name.c_str(),
+                  resolved.port,
+                  resolved.user.c_str());
+    terminal->append_text(resolved_line);
+
+    if (!terminal->is_wifi_connected()) {
+        if (!resolved.network.empty()) {
+            terminal->append_text("WiFi is disconnected; alias requests network profile: ");
+            terminal->append_text(resolved.network.c_str());
+            terminal->append_text("\n");
+            if (!connect_wifi_profile_by_name_or_ssid(terminal, resolved.network)) {
+                terminal->append_text("ERROR: failed to connect required WiFi profile\n");
+                return;
+            }
+        } else {
+            terminal->append_text("ERROR: WiFi not connected\n");
+            terminal->append_text("Use: connect <SSID> <PASSWORD> or configure 'Network' in ssh_config alias\n");
+            return;
+        }
+    }
+
+    if (connect_with_alias_identities(terminal, resolved)) {
+        return;
+    }
+
+    if (!resolved.network.empty() && terminal->is_wifi_connected()) {
+        terminal->append_text("Retrying after reconnecting alias network profile...\n");
+        if (connect_wifi_profile_by_name_or_ssid(terminal, resolved.network)) {
+            (void)connect_with_alias_identities(terminal, resolved);
         }
     }
 }
@@ -1074,7 +1631,17 @@ SSHTerminal::SSHTerminal()
       session(NULL),
       channel(NULL),
       hostname(NULL),
-      port_number(22)
+      port_number(22),
+      connected_wifi_ssid(""),
+      connected_ssh_host(""),
+      terminal_font_big(false),
+      touch_scrub_active(false),
+      touch_scrub_moved(false),
+      touch_scrub_axis_locked(false),
+      touch_scrub_vertical_mode(false),
+      touch_scrub_last_x(0),
+      touch_scrub_last_y(0),
+      touch_scrub_accum_x(0)
 {
     vTaskDelay(pdMS_TO_TICKS(100));
     
@@ -1222,6 +1789,7 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
         if (bits & WIFI_CONNECTED_BIT) {
             ESP_LOGI(TAG, "Connected to AP SSID:%s", ssid);
             wifi_connected = true;
+            connected_wifi_ssid = (ssid != nullptr) ? ssid : "";
             
             if (display_lock(0)) {
                 update_status_bar();
@@ -1233,6 +1801,7 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
         } else if (bits & WIFI_FAIL_BIT) {
             ESP_LOGI(TAG, "Failed to connect to SSID:%s", ssid);
             wifi_connected = false;
+            connected_wifi_ssid.clear();
             
             if (display_lock(0)) {
                 update_status_bar();
@@ -1250,6 +1819,7 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
     
     ESP_LOGE(TAG, "Connection timeout");
     wifi_connected = false;
+    connected_wifi_ssid.clear();
     s_retry_num = 0;
     
     if (display_lock(0)) {
@@ -1366,8 +1936,13 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     lv_label_set_long_mode(input_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(input_label, LV_ALIGN_LEFT_MID, 0, 0);
     
-    // Enable touch events on input label
+    // Touch contract:
+    // - tap positions the cursor
+    // - horizontal drag ("scrub") emits repeated left/right cursor moves
     lv_obj_add_flag(input_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(input_label, input_touch_event_cb, LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(input_label, input_touch_event_cb, LV_EVENT_PRESSING, this);
+    lv_obj_add_event_cb(input_label, input_touch_event_cb, LV_EVENT_RELEASED, this);
     lv_obj_add_event_cb(input_label, input_touch_event_cb, LV_EVENT_CLICKED, this);
 
     create_side_panel();
@@ -1378,6 +1953,10 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     cursor_blink_timer = lv_timer_create(cursor_blink_cb, 500, this);
     
     battery_update_timer = lv_timer_create(battery_update_cb, 60000, this);
+
+    load_default_terminal_font_mode_from_config();
+    apply_terminal_font_mode();
+    update_status_bar();
     
     history_save_timer = lv_timer_create(history_save_cb, 5000, this);
 
@@ -1385,7 +1964,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     const char* logo =
         "PocketSSH T-Pager\n"
         "Type 'help' for commands.\n"
-        "Start with: hosts, connect <alias>, or connect <SSID> <PASSWORD>\n\n";
+        "Start with: wifi auto, hosts, or connect <alias>\n\n";
     #else
     const char* logo = 
         "\n"
@@ -1394,8 +1973,12 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
         "  ================================================\n"
         "\n"
         "  Commands:\n"
+        "   wifi - List configured WiFi profiles\n"
+        "   wifi <Network|SSID> - Connect from wifi_config\n"
+        "   wifi auto - Try AutoConnect profiles in file order\n"
         "   connect <ALIAS> - Resolve via ssh_config and SSH key\n"
         "   connect <SSID> <PASSWORD>  - WiFi connect\n"
+        "   fontsize [big|normal] - Toggle/set font size\n"
         "     Use quotes for spaces: connect \"My WiFi\" \"my pass\"\n"
         "   hosts - List aliases from /sdcard/ssh_keys/ssh_config\n"
         "   ssh <HOST> <PORT> <USER> <PASS> - SSH\n"
@@ -1492,6 +2075,42 @@ void SSHTerminal::handle_key_input(char key)
                     append_text("  Use quotes for SSIDs/passwords with spaces: connect \"My WiFi\" password\n");
                 }
             }
+            else if (current_input.rfind("wifi", 0) == 0) {
+                const std::vector<std::string> args = split_quoted_arguments(current_input, 4);
+                if (args.empty()) {
+                    std::vector<WifiProfile> profiles;
+                    if (!parse_wifi_config_file(&profiles)) {
+                        append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config or /sdcard/wifi_config\n");
+                    } else if (profiles.empty()) {
+                        append_text("No WiFi profiles found in wifi_config\n");
+                    } else {
+                        append_text("Configured WiFi profiles:\n");
+                        for (const auto &profile : profiles) {
+                            append_text("  ");
+                            if (!profile.network_name.empty()) {
+                                append_text(profile.network_name.c_str());
+                            } else {
+                                append_text("<unnamed>");
+                            }
+                            append_text(" (SSID: ");
+                            append_text(profile.ssid.empty() ? "<missing>" : profile.ssid.c_str());
+                            append_text(")");
+                            if (profile.has_auto_connect && profile.auto_connect) {
+                                append_text(" [auto]");
+                            }
+                            append_text("\n");
+                        }
+                    }
+                } else if (lowercase_ascii(args[0]) == "auto") {
+                    (void)auto_connect_wifi_profiles(this);
+                } else {
+                    if (connect_wifi_profile_by_name_or_ssid(this, args[0])) {
+                        append_text("WiFi connected via profile\n");
+                    } else {
+                        append_text("WiFi profile connection failed\n");
+                    }
+                }
+            }
             else if (current_input.rfind("ssh ", 0) == 0) {
                 std::vector<std::string> parts = split_nonempty_whitespace(current_input);
                 
@@ -1557,10 +2176,28 @@ void SSHTerminal::handle_key_input(char key)
                     s_retry_num = WIFI_MAXIMUM_RETRY;
                     esp_wifi_disconnect();
                     wifi_connected = false;
+                    connected_wifi_ssid.clear();
                     update_status_bar();
                     append_text("WiFi disconnected\n");
                 } else {
                     append_text("WiFi not connected\n");
+                }
+            }
+            else if (current_input.rfind("fontsize", 0) == 0) {
+                if (ssh_connected) {
+                    append_text("fontsize is only available when not in an SSH session\n");
+                } else {
+                    const std::vector<std::string> args = split_quoted_arguments(current_input, 8);
+                    if (args.empty()) {
+                        set_terminal_font_mode(!terminal_font_big, true);
+                    } else {
+                        bool parsed_big = false;
+                        if (parse_fontsize_token(args[0], &parsed_big)) {
+                            set_terminal_font_mode(parsed_big, true);
+                        } else {
+                            append_text("Usage: fontsize [big|normal]\n");
+                        }
+                    }
                 }
             }
             else if (current_input == "exit") {
@@ -1571,6 +2208,9 @@ void SSHTerminal::handle_key_input(char key)
             }
             else if (current_input == "help") {
                 append_text("Available commands:\n");
+                append_text("  wifi - List configured WiFi profiles\n");
+                append_text("  wifi <Network|SSID> - Connect using wifi_config\n");
+                append_text("  wifi auto - Try AutoConnect profiles\n");
                 append_text("  hosts - List aliases from /sdcard/ssh_keys/ssh_config\n");
                 append_text("  connect <ALIAS> - Resolve alias from ssh_config and connect via key\n");
                 append_text("  connect <SSID> <PASSWORD> - Connect to WiFi\n");
@@ -1580,10 +2220,21 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("  ssh <HOST> <PORT> <USER> <PASS> - Connect via SSH\n");
                 append_text("  sshkey <HOST> <PORT> <USER> <KEYFILE> - Connect via SSH with private key\n");
                 append_text("    Note: Place .pem keys in /sdcard/ssh_keys/ before use\n");
+                append_text("  shutdown | poweroff - Deep sleep (wake via BOOT or encoder button)\n");
                 append_text("  disconnect - Disconnect WiFi\n");
+                append_text("  fontsize - Toggle terminal font size (not during SSH)\n");
+                append_text("  fontsize big|normal - Set terminal font size\n");
                 append_text("  exit - Disconnect SSH\n");
                 append_text("  clear - Clear terminal\n");
                 append_text("  help - Show this help\n");
+            }
+            else if (current_input == "shutdown" || current_input == "poweroff") {
+#if defined(TPAGER_TARGET)
+                append_text("Shutting down. Wake with BOOT or encoder button.\n");
+                tpager_request_shutdown();
+#else
+                append_text("Shutdown is only supported on TPAGER target builds\n");
+#endif
             }
             else if (current_input == "hosts") {
                 SSHConfigFile parsed = {};
@@ -1669,16 +2320,91 @@ void SSHTerminal::input_touch_event_cb(lv_event_t* e)
 {
     SSHTerminal* terminal = (SSHTerminal*)lv_event_get_user_data(e);
     lv_obj_t* input_label = (lv_obj_t* )lv_event_get_target(e);
+    const lv_event_code_t code = lv_event_get_code(e);
     
     if (!terminal || !input_label) {
         return;
     }
-    
-    // Get the touch point relative to the label
+
+    lv_indev_t* indev = lv_indev_get_act();
+    if (indev == nullptr) {
+        return;
+    }
+
     lv_point_t point;
-    lv_indev_get_point(lv_indev_get_act(), &point);
-    
-    // Convert to label coordinates
+    lv_indev_get_point(indev, &point);
+
+    if (code == LV_EVENT_PRESSED) {
+        terminal->touch_scrub_active = true;
+        terminal->touch_scrub_moved = false;
+        terminal->touch_scrub_axis_locked = false;
+        terminal->touch_scrub_vertical_mode = false;
+        terminal->touch_scrub_last_x = point.x;
+        terminal->touch_scrub_last_y = point.y;
+        terminal->touch_scrub_accum_x = 0;
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSING) {
+        if (!terminal->touch_scrub_active) {
+            return;
+        }
+        constexpr int32_t kAxisLockThresholdPx = 4;
+        constexpr int32_t kHorizontalStepPx = 12;
+        const int32_t delta_x = point.x - terminal->touch_scrub_last_x;
+        const int32_t delta_y = point.y - terminal->touch_scrub_last_y;
+        terminal->touch_scrub_last_x = point.x;
+        terminal->touch_scrub_last_y = point.y;
+
+        if (!terminal->touch_scrub_axis_locked &&
+            (std::abs(delta_x) >= kAxisLockThresholdPx || std::abs(delta_y) >= kAxisLockThresholdPx)) {
+            terminal->touch_scrub_axis_locked = true;
+            terminal->touch_scrub_vertical_mode = (std::abs(delta_y) > std::abs(delta_x));
+        }
+
+        if (!terminal->touch_scrub_axis_locked) {
+            return;
+        }
+
+        if (terminal->touch_scrub_vertical_mode) {
+            if (terminal->terminal_output != nullptr && delta_y != 0) {
+                lv_obj_scroll_by(terminal->terminal_output, 0, -delta_y, LV_ANIM_OFF);
+                terminal->touch_scrub_moved = true;
+            }
+            return;
+        }
+
+        terminal->touch_scrub_accum_x += delta_x;
+        while (terminal->touch_scrub_accum_x >= kHorizontalStepPx) {
+            terminal->move_cursor_right();
+            terminal->touch_scrub_accum_x -= kHorizontalStepPx;
+            terminal->touch_scrub_moved = true;
+        }
+        while (terminal->touch_scrub_accum_x <= -kHorizontalStepPx) {
+            terminal->move_cursor_left();
+            terminal->touch_scrub_accum_x += kHorizontalStepPx;
+            terminal->touch_scrub_moved = true;
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED) {
+        terminal->touch_scrub_active = false;
+        terminal->touch_scrub_axis_locked = false;
+        terminal->touch_scrub_vertical_mode = false;
+        return;
+    }
+
+    if (code != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    if (terminal->touch_scrub_moved) {
+        terminal->touch_scrub_moved = false;
+        return;
+    }
+
+    // Convert to label coordinates for point-to-cursor tap placement.
     lv_obj_t* label = input_label;
     lv_area_t label_coords;
     lv_obj_get_coords(label, &label_coords);
@@ -1724,7 +2450,7 @@ void SSHTerminal::input_touch_event_cb(lv_event_t* e)
     terminal->cursor_visible = true;
     terminal->update_input_display();
     
-    ESP_LOGI(TAG, "Cursor moved to position: %d", terminal->cursor_pos);
+    ESP_LOGI(TAG, "Cursor moved to position: %d", static_cast<int>(terminal->cursor_pos));
 }
 
 void SSHTerminal::cursor_blink_cb(lv_timer_t* timer)
@@ -1812,6 +2538,15 @@ void SSHTerminal::move_cursor_end()
     cursor_pos = current_input.length();
     cursor_visible = true;
     update_input_display();
+}
+
+void SSHTerminal::scroll_terminal_output(int steps)
+{
+    if (terminal_output == nullptr || steps == 0) {
+        return;
+    }
+    constexpr int kPixelsPerStep = 20;
+    lv_obj_scroll_by(terminal_output, 0, steps * kPixelsPerStep, LV_ANIM_OFF);
 }
 
 void SSHTerminal::delete_current_history_entry()
@@ -2161,6 +2896,10 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
 
     append_text("SSH channel opened - connected!\n");
     ssh_connected = true;
+    connected_ssh_host = host != nullptr ? host : "";
+    if (port != 22 && !connected_ssh_host.empty()) {
+        connected_ssh_host += ":" + std::to_string(port);
+    }
     update_status_bar();
 
     BaseType_t rx_task_ok = xTaskCreate(ssh_receive_task, "ssh_rx", 6144, this, 5, NULL);
@@ -2299,6 +3038,10 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
 
     append_text("SSH channel opened - connected!\n");
     ssh_connected = true;
+    connected_ssh_host = host != nullptr ? host : "";
+    if (port != 22 && !connected_ssh_host.empty()) {
+        connected_ssh_host += ":" + std::to_string(port);
+    }
     update_status_bar();
 
     BaseType_t rx_task_ok = xTaskCreate(ssh_receive_task, "ssh_rx", 6144, this, 5, NULL);
@@ -2401,6 +3144,7 @@ esp_err_t SSHTerminal::ssh_open_channel()
 esp_err_t SSHTerminal::disconnect()
 {
     ssh_connected = false;
+    connected_ssh_host.clear();
     
     if (channel) {
         libssh2_channel_free(channel);
@@ -2625,6 +3369,53 @@ void SSHTerminal::flush_display_buffer()
     vTaskDelay(1);
 }
 
+void SSHTerminal::load_default_terminal_font_mode_from_config()
+{
+    bool config_big = false;
+    if (!read_default_fontsize_big_from_config(&config_big)) {
+        terminal_font_big = false;
+        return;
+    }
+    terminal_font_big = config_big;
+    ESP_LOGI(TAG, "Default terminal font from ssh_config: %s", terminal_font_big ? "big" : "normal");
+}
+
+void SSHTerminal::apply_terminal_font_mode()
+{
+    if (!terminal_output) {
+        return;
+    }
+    const lv_font_t *font = terminal_font_big ? ui_font_terminal_big() : ui_font_small();
+    lv_obj_set_style_text_font(terminal_output, font, 0);
+    update_input_display();
+}
+
+void SSHTerminal::set_terminal_font_mode(bool big_mode, bool announce)
+{
+    if (terminal_font_big == big_mode) {
+        if (announce) {
+            append_text(big_mode ? "fontsize already big\n" : "fontsize already normal\n");
+        }
+        return;
+    }
+
+    terminal_font_big = big_mode;
+    if (display_lock(0)) {
+        apply_terminal_font_mode();
+        display_unlock();
+    } else {
+        apply_terminal_font_mode();
+    }
+
+    if (announce) {
+        if (terminal_font_big) {
+            append_text("fontsize set to big (~53x9)\n");
+        } else {
+            append_text("fontsize set to normal (~67x13)\n");
+        }
+    }
+}
+
 void SSHTerminal::update_status_bar()
 {
     if (!status_bar) return;
@@ -2652,12 +3443,26 @@ void SSHTerminal::update_status_bar()
     if (!wifi_connected) {
         status += LV_SYMBOL_WIFI " OFF";
         lv_obj_set_style_text_color(status_bar, lv_color_hex(0xFF0000), 0);
-    } else if (!ssh_connected) {
-        status += LV_SYMBOL_WIFI " | " LV_SYMBOL_CLOSE " SSH";
-        lv_obj_set_style_text_color(status_bar, lv_color_hex(0xFFFF00), 0);
     } else {
-        status += LV_SYMBOL_WIFI " | " LV_SYMBOL_OK " SSH";
-        lv_obj_set_style_text_color(status_bar, lv_color_hex(0x00FF00), 0);
+        status += LV_SYMBOL_WIFI " ";
+        if (connected_wifi_ssid.empty()) {
+            status += "ON";
+        } else {
+            status += abbreviate_status_value(connected_wifi_ssid, 12);
+        }
+
+        if (!ssh_connected) {
+            status += " | " LV_SYMBOL_CLOSE " SSH";
+            lv_obj_set_style_text_color(status_bar, lv_color_hex(0xFFFF00), 0);
+        } else {
+            status += " | " LV_SYMBOL_OK " ";
+            if (connected_ssh_host.empty()) {
+                status += "SSH";
+            } else {
+                status += abbreviate_status_value(connected_ssh_host, 14);
+            }
+            lv_obj_set_style_text_color(status_bar, lv_color_hex(0x00FF00), 0);
+        }
     }
     
     lv_label_set_text(status_bar, status.c_str());

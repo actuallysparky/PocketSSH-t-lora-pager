@@ -744,6 +744,83 @@ bool read_file_contents(const std::string &path, std::string *contents)
     return true;
 }
 
+std::string normalize_key_stem(const std::string &filename)
+{
+    std::string stem = lowercase_ascii(base_name(filename));
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos) {
+        stem = stem.substr(0, dot);
+    }
+
+    std::string normalized;
+    normalized.reserve(stem.size());
+    for (char c : stem) {
+        if (std::isalnum(static_cast<unsigned char>(c)) != 0) {
+            normalized.push_back(c);
+        }
+    }
+    return normalized;
+}
+
+const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
+                                          const std::string &identity_path,
+                                          std::string *resolved_key_name,
+                                          size_t *resolved_len)
+{
+    if (terminal == nullptr) {
+        return nullptr;
+    }
+
+    const std::string desired_name = base_name(identity_path);
+    const char *direct = terminal->get_loaded_key(desired_name.c_str(), resolved_len);
+    if (direct != nullptr) {
+        if (resolved_key_name != nullptr) {
+            *resolved_key_name = desired_name;
+        }
+        return direct;
+    }
+
+    const std::vector<std::string> key_names = terminal->get_loaded_key_names();
+    if (key_names.empty()) {
+        return nullptr;
+    }
+
+    const std::string target_stem = normalize_key_stem(desired_name);
+
+    // FAT may expose only short 8.3 aliases (e.g. PRODMI~5.PEM). Prefer an
+    // unambiguous stem match; otherwise fallback to single loaded key.
+    std::string matched_name;
+    int match_count = 0;
+    for (const std::string &candidate : key_names) {
+        const std::string candidate_stem = normalize_key_stem(candidate);
+        if (candidate_stem.empty() || target_stem.empty()) {
+            continue;
+        }
+        if (candidate_stem == target_stem ||
+            target_stem.rfind(candidate_stem, 0) == 0 ||
+            candidate_stem.rfind(target_stem, 0) == 0) {
+            matched_name = candidate;
+            match_count++;
+        }
+    }
+
+    if (match_count == 1) {
+        if (resolved_key_name != nullptr) {
+            *resolved_key_name = matched_name;
+        }
+        return terminal->get_loaded_key(matched_name.c_str(), resolved_len);
+    }
+
+    if (key_names.size() == 1) {
+        if (resolved_key_name != nullptr) {
+            *resolved_key_name = key_names.front();
+        }
+        return terminal->get_loaded_key(key_names.front().c_str(), resolved_len);
+    }
+
+    return nullptr;
+}
+
 void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
 {
     if (terminal == nullptr || alias.empty()) {
@@ -780,9 +857,9 @@ void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
     bool attempted_identity = false;
     bool connected = false;
     for (const std::string &identity_path : resolved.identity_files) {
-        const std::string key_name = base_name(identity_path);
+        std::string key_name = base_name(identity_path);
         size_t key_len = 0;
-        const char *loaded_key = terminal->get_loaded_key(key_name.c_str(), &key_len);
+        const char *loaded_key = find_loaded_key_with_fallback(terminal, identity_path, &key_name, &key_len);
 
         terminal->append_text("Trying identity: ");
         terminal->append_text(identity_path.c_str());
@@ -790,6 +867,11 @@ void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
 
         attempted_identity = true;
         if (loaded_key != nullptr && key_len > 0) {
+            if (key_name != base_name(identity_path)) {
+                terminal->append_text("  Using loaded key alias: ");
+                terminal->append_text(key_name.c_str());
+                terminal->append_text("\n");
+            }
             if (terminal->connect_with_key(resolved.host_name.c_str(),
                                            resolved.port,
                                            resolved.user.c_str(),

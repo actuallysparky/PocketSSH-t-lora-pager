@@ -743,6 +743,89 @@ bool read_file_contents(const std::string &path, std::string *contents)
     *contents = std::move(data);
     return true;
 }
+
+void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
+{
+    if (terminal == nullptr || alias.empty()) {
+        return;
+    }
+
+    ResolvedSSHConfig resolved = {};
+    if (!resolve_ssh_alias(alias, &resolved)) {
+        terminal->append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
+        terminal->append_text("Hint: run 'hosts' to list available aliases.\n");
+        return;
+    }
+
+    if (!terminal->is_wifi_connected()) {
+        terminal->append_text("ERROR: WiFi not connected\n");
+        terminal->append_text("Use: connect <SSID> <PASSWORD>\n");
+        return;
+    }
+
+    if (resolved.user.empty()) {
+        terminal->append_text("ERROR: ssh_config alias missing User directive\n");
+        return;
+    }
+
+    char resolved_line[196];
+    std::snprintf(resolved_line, sizeof(resolved_line),
+                  "Resolved %s -> %s:%d as %s\n",
+                  resolved.alias.c_str(),
+                  resolved.host_name.c_str(),
+                  resolved.port,
+                  resolved.user.c_str());
+    terminal->append_text(resolved_line);
+
+    bool attempted_identity = false;
+    bool connected = false;
+    for (const std::string &identity_path : resolved.identity_files) {
+        const std::string key_name = base_name(identity_path);
+        size_t key_len = 0;
+        const char *loaded_key = terminal->get_loaded_key(key_name.c_str(), &key_len);
+
+        terminal->append_text("Trying identity: ");
+        terminal->append_text(identity_path.c_str());
+        terminal->append_text("\n");
+
+        attempted_identity = true;
+        if (loaded_key != nullptr && key_len > 0) {
+            if (terminal->connect_with_key(resolved.host_name.c_str(),
+                                           resolved.port,
+                                           resolved.user.c_str(),
+                                           loaded_key,
+                                           key_len) == ESP_OK) {
+                connected = true;
+                break;
+            }
+            continue;
+        }
+
+        std::string key_data;
+        if (!read_file_contents(identity_path, &key_data)) {
+            terminal->append_text("  Skipping: unable to read key file\n");
+            continue;
+        }
+
+        if (terminal->connect_with_key(resolved.host_name.c_str(),
+                                       resolved.port,
+                                       resolved.user.c_str(),
+                                       key_data.c_str(),
+                                       key_data.size()) == ESP_OK) {
+            connected = true;
+            break;
+        }
+    }
+
+    if (!connected) {
+        if (!attempted_identity) {
+            terminal->append_text("ERROR: Alias has no IdentityFile entries\n");
+            terminal->append_text("Add IdentityFile in ssh_config or use ssh/sshkey command directly.\n");
+        } else {
+            terminal->append_text("ERROR: All configured identity files failed\n");
+        }
+    }
+}
 } // namespace
 
 namespace {
@@ -1200,75 +1283,7 @@ void SSHTerminal::handle_key_input(char key)
                 const std::vector<std::string> args = split_quoted_arguments(current_input, 8);
 
                 if (args.size() == 1) {
-                    const std::string alias = args[0];
-                    ResolvedSSHConfig resolved = {};
-                    if (!resolve_ssh_alias(alias, &resolved)) {
-                        append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
-                        append_text("Hint: run 'hosts' to list available aliases.\n");
-                    } else if (!wifi_connected) {
-                        append_text("ERROR: WiFi not connected\n");
-                        append_text("Use: connect <SSID> <PASSWORD>\n");
-                    } else if (resolved.user.empty()) {
-                        append_text("ERROR: ssh_config alias missing User directive\n");
-                    } else {
-                        char resolved_line[196];
-                        std::snprintf(resolved_line, sizeof(resolved_line),
-                                      "Resolved %s -> %s:%d as %s\n",
-                                      resolved.alias.c_str(),
-                                      resolved.host_name.c_str(),
-                                      resolved.port,
-                                      resolved.user.c_str());
-                        append_text(resolved_line);
-
-                        bool attempted_identity = false;
-                        bool connected = false;
-                        for (const std::string &identity_path : resolved.identity_files) {
-                            const std::string key_name = base_name(identity_path);
-                            size_t key_len = 0;
-                            const char *loaded_key = get_loaded_key(key_name.c_str(), &key_len);
-
-                            append_text("Trying identity: ");
-                            append_text(identity_path.c_str());
-                            append_text("\n");
-
-                            attempted_identity = true;
-                            if (loaded_key != nullptr && key_len > 0) {
-                                if (connect_with_key(resolved.host_name.c_str(),
-                                                     resolved.port,
-                                                     resolved.user.c_str(),
-                                                     loaded_key,
-                                                     key_len) == ESP_OK) {
-                                    connected = true;
-                                    break;
-                                }
-                                continue;
-                            }
-
-                            std::string key_data;
-                            if (!read_file_contents(identity_path, &key_data)) {
-                                append_text("  Skipping: unable to read key file\n");
-                                continue;
-                            }
-
-                            if (connect_with_key(resolved.host_name.c_str(),
-                                                 resolved.port,
-                                                 resolved.user.c_str(),
-                                                 key_data.c_str(),
-                                                 key_data.size()) == ESP_OK) {
-                                connected = true;
-                                break;
-                            }
-                        }
-
-                        if (!connected) {
-                            if (!attempted_identity) {
-                                append_text("ERROR: Alias has no IdentityFile entries\n");
-                                append_text("Add IdentityFile in ssh_config or use ssh/sshkey command directly.\n");
-                            } else {
-                                append_text("ERROR: All configured identity files failed\n");
-                            }
-                        }
-                    }
+                    connect_using_ssh_alias(this, args[0]);
                 } else if (args.size() >= 2) {
                     std::string ssid = args[0];
                     std::string password = args[1];
@@ -1292,7 +1307,9 @@ void SSHTerminal::handle_key_input(char key)
             else if (current_input.rfind("ssh ", 0) == 0) {
                 std::vector<std::string> parts = split_nonempty_whitespace(current_input);
                 
-                if (parts.size() >= 5) {
+                if (parts.size() == 2) {
+                    connect_using_ssh_alias(this, parts[1]);
+                } else if (parts.size() >= 5) {
                     std::string host = parts[1];
                     int port = std::atoi(parts[2].c_str());
                     std::string user = parts[3];
@@ -1304,6 +1321,7 @@ void SSHTerminal::handle_key_input(char key)
                         connect(host.c_str(), port, user.c_str(), pass.c_str());
                     }
                 } else {
+                    append_text("Usage: ssh <ALIAS>\n");
                     append_text("Usage: ssh <HOST> <PORT> <USER> <PASS>\n");
                 }
             }
@@ -1370,6 +1388,7 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("  connect <SSID> <PASSWORD> - Connect to WiFi\n");
                 append_text("    Use quotes for spaces: connect \"My WiFi\" password\n");
                 append_text("  netinfo - Show WiFi IP/netmask/gateway\n");
+                append_text("  ssh <ALIAS> - Resolve alias from ssh_config and connect via key\n");
                 append_text("  ssh <HOST> <PORT> <USER> <PASS> - Connect via SSH\n");
                 append_text("  sshkey <HOST> <PORT> <USER> <KEYFILE> - Connect via SSH with private key\n");
                 append_text("    Note: Place .pem keys in /sdcard/ssh_keys/ before use\n");

@@ -162,7 +162,7 @@ esp_err_t init_lvgl(DiagDisplay *display)
     }
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_text_color(scr, lv_color_hex(0xF2F7F5), 0);
+    lv_obj_set_style_text_color(scr, lv_color_hex(0xFFFFFF), 0);
 
     lv_obj_t *frame = lv_obj_create(scr);
     lv_obj_set_size(frame, kDisplayHRes, kDisplayVRes);
@@ -175,24 +175,24 @@ esp_err_t init_lvgl(DiagDisplay *display)
     lv_obj_move_background(frame);
 
     display->title_label = lv_label_create(scr);
-    lv_obj_align(display->title_label, LV_ALIGN_TOP_LEFT, 16, 12);
+    lv_obj_align(display->title_label, LV_ALIGN_TOP_LEFT, 8, 8);
     lv_label_set_text(display->title_label, "PocketSSH T-Pager diag");
 
     display->stage_label = lv_label_create(scr);
-    lv_obj_align(display->stage_label, LV_ALIGN_TOP_LEFT, 16, 38);
+    lv_obj_align(display->stage_label, LV_ALIGN_TOP_LEFT, 8, 30);
     lv_label_set_text(display->stage_label, "Stage: boot");
 
     display->kbd_label = lv_label_create(scr);
-    lv_obj_align(display->kbd_label, LV_ALIGN_TOP_LEFT, 16, 64);
+    lv_obj_align(display->kbd_label, LV_ALIGN_TOP_LEFT, 8, 52);
     lv_label_set_text(display->kbd_label, "KBD ev=0 p=0 r=0 irq=-");
 
     display->enc_label = lv_label_create(scr);
-    lv_obj_align(display->enc_label, LV_ALIGN_TOP_LEFT, 16, 90);
+    lv_obj_align(display->enc_label, LV_ALIGN_TOP_LEFT, 8, 74);
     lv_label_set_text(display->enc_label, "ENC net=0 trans=0");
 
     display->line_label = lv_label_create(scr);
-    lv_obj_set_width(display->line_label, kDisplayHRes - 24);
-    lv_obj_align(display->line_label, LV_ALIGN_BOTTOM_LEFT, 16, -8);
+    lv_obj_set_width(display->line_label, kDisplayHRes - 16);
+    lv_obj_align(display->line_label, LV_ALIGN_BOTTOM_LEFT, 8, -6);
     lv_label_set_text(display->line_label, "Last line: <none>");
 
     lv_obj_t *corner_tl = lv_label_create(scr);

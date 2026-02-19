@@ -12,6 +12,19 @@ if(TPAGER_DIAG)
         "tpager_encoder.cpp"
         "esp_lcd_st7796.c"
     )
+elseif(TPAGER_TARGET)
+    # TPAGER_TARGET runtime path: dedicated app entrypoint for the T-Pager hardware.
+    set(SOURCES
+        "tpager_base.cpp"
+        "battery_measurement.cpp"
+        "ssh_terminal.cpp"
+        "tpager_display.cpp"
+        "tpager_sd.cpp"
+        "tpager_xl9555.cpp"
+        "tpager_tca8418.cpp"
+        "tpager_encoder.cpp"
+        "esp_lcd_st7796.c"
+    )
 else()
     set(SOURCES
         "deck_base.cpp"
@@ -45,6 +58,20 @@ if(TPAGER_DIAG)
         fatfs
         sdmmc
         nvs_flash
+    )
+elseif(TPAGER_TARGET)
+    set(REQUIRED_COMPONENTS
+        driver
+        esp_lcd
+        esp_lvgl_port
+        lvgl
+        esp_timer
+        fatfs
+        sdmmc
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
     )
 else()
     set(REQUIRED_COMPONENTS

@@ -19,8 +19,12 @@
 #include "lwip/sys.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#if defined(TPAGER_TARGET)
+#include "esp_lvgl_port.h"
+#else
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#endif
 #include <cstring>
 #include <algorithm>
 #include <sys/socket.h>
@@ -34,6 +38,24 @@ static const char *TAG = "SSH_TERMINAL";
 namespace {
 // Font fallback contract: keep UI readable even when smaller Montserrat faces
 // are disabled in sdkconfig/LVGL.
+bool display_lock(uint32_t timeout_ms)
+{
+#if defined(TPAGER_TARGET)
+    return lvgl_port_lock(timeout_ms);
+#else
+    return bsp_display_lock(timeout_ms);
+#endif
+}
+
+void display_unlock()
+{
+#if defined(TPAGER_TARGET)
+    lvgl_port_unlock();
+#else
+    bsp_display_unlock();
+#endif
+}
+
 const lv_font_t* ui_font_small()
 {
 #if defined(LV_FONT_MONTSERRAT_10) && LV_FONT_MONTSERRAT_10
@@ -160,9 +182,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             char ip_str[64];
             snprintf(ip_str, sizeof(ip_str), "WiFi Connected! IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
             
-            if (bsp_display_lock(0)) {
+            if (display_lock(0)) {
                 terminal->append_text(ip_str);
-                bsp_display_unlock();
+                display_unlock();
             }
         }
     }
@@ -250,25 +272,25 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
             ESP_LOGI(TAG, "Connected to AP SSID:%s", ssid);
             wifi_connected = true;
             
-            if (bsp_display_lock(0)) {
+            if (display_lock(0)) {
                 update_status_bar();
-                bsp_display_unlock();
+                display_unlock();
             }
             return ESP_OK;
         } else if (bits & WIFI_FAIL_BIT) {
             ESP_LOGI(TAG, "Failed to connect to SSID:%s", ssid);
             wifi_connected = false;
             
-            if (bsp_display_lock(0)) {
+            if (display_lock(0)) {
                 update_status_bar();
-                bsp_display_unlock();
+                display_unlock();
             }
             return ESP_FAIL;
         }
         
-        if (bsp_display_lock(0)) {
+        if (display_lock(0)) {
             append_text(".");
-            bsp_display_unlock();
+            display_unlock();
         }
         elapsed_ms += check_interval_ms;
     }
@@ -277,9 +299,9 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
     wifi_connected = false;
     s_retry_num = 0;
     
-    if (bsp_display_lock(0)) {
+    if (display_lock(0)) {
         update_status_bar();
-        bsp_display_unlock();
+        display_unlock();
     }
     return ESP_FAIL;
 }
@@ -298,24 +320,54 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
 
     status_bar = lv_label_create(terminal_screen);
     lv_label_set_text(status_bar, "Status: Disconnected");
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_style_text_color(status_bar, lv_color_hex(0xD9F2E6), 0);
+    #else
     lv_obj_set_style_text_color(status_bar, lv_color_hex(0x00FF00), 0);
+    #endif
     lv_obj_set_style_text_font(status_bar, ui_font_body(), 0);
+    #if defined(TPAGER_TARGET)
+    lv_obj_align(status_bar, LV_ALIGN_TOP_LEFT, 4, 2);
+    #else
     lv_obj_align(status_bar, LV_ALIGN_TOP_LEFT, 5, 5);
+    #endif
     
     byte_counter_label = lv_label_create(terminal_screen);
     lv_label_set_text(byte_counter_label, "0 B");
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_style_text_color(byte_counter_label, lv_color_hex(0xAEE6FF), 0);
+    #else
     lv_obj_set_style_text_color(byte_counter_label, lv_color_hex(0x00FFFF), 0);
+    #endif
     lv_obj_set_style_text_font(byte_counter_label, ui_font_body(), 0);
+    #if defined(TPAGER_TARGET)
+    lv_obj_align(byte_counter_label, LV_ALIGN_TOP_RIGHT, -4, 2);
+    #else
     lv_obj_align(byte_counter_label, LV_ALIGN_TOP_RIGHT, -5, 5);
+    #endif
 
     terminal_output = lv_textarea_create(terminal_screen);
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_size(terminal_output, lv_pct(100) - 8, lv_pct(76));
+    lv_obj_align(terminal_output, LV_ALIGN_TOP_MID, 0, 18);
+    #else
     lv_obj_set_size(terminal_output, lv_pct(100), lv_pct(75));
     lv_obj_align(terminal_output, LV_ALIGN_TOP_MID, 0, 25);
+    #endif
     lv_obj_set_style_bg_color(terminal_output, lv_color_black(), 0);
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_style_text_color(terminal_output, lv_color_hex(0xF7FFF9), 0);
+    #else
     lv_obj_set_style_text_color(terminal_output, lv_color_hex(0x00FF00), 0);
+    #endif
     lv_obj_set_style_text_font(terminal_output, ui_font_small(), 0);
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_style_border_color(terminal_output, lv_color_hex(0x48A878), 0);
+    lv_obj_set_style_border_width(terminal_output, 1, 0);
+    #else
     lv_obj_set_style_border_color(terminal_output, lv_color_hex(0x00FF00), 0);
     lv_obj_set_style_border_width(terminal_output, 2, 0);
+    #endif
     lv_textarea_set_cursor_click_pos(terminal_output, false);
     lv_textarea_set_one_line(terminal_output, false);
     lv_obj_set_scrollbar_mode(terminal_output, LV_SCROLLBAR_MODE_OFF);
@@ -330,17 +382,29 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     lv_obj_clear_flag(terminal_output, LV_OBJ_FLAG_SCROLL_ELASTIC);
 
     lv_obj_t* input_container = lv_obj_create(terminal_screen);
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_size(input_container, lv_pct(100) - 8, 22);
+    #else
     lv_obj_set_size(input_container, lv_pct(100) - 10, 25);
+    #endif
     lv_obj_set_style_bg_opa(input_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(input_container, 0, 0);
     lv_obj_set_style_pad_all(input_container, 0, 0);
     lv_obj_set_scrollbar_mode(input_container, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(input_container, LV_DIR_HOR);
+    #if defined(TPAGER_TARGET)
+    lv_obj_align(input_container, LV_ALIGN_BOTTOM_LEFT, 4, -2);
+    #else
     lv_obj_align(input_container, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+    #endif
     
     input_label = lv_label_create(input_container);
     lv_label_set_text(input_label, "> ");
+    #if defined(TPAGER_TARGET)
+    lv_obj_set_style_text_color(input_label, lv_color_hex(0xFFE9A8), 0);
+    #else
     lv_obj_set_style_text_color(input_label, lv_color_hex(0xFFFF00), 0);
+    #endif
     lv_obj_set_style_text_font(input_label, ui_font_body(), 0);
     lv_label_set_long_mode(input_label, LV_LABEL_LONG_CLIP);
     lv_obj_align(input_label, LV_ALIGN_LEFT_MID, 0, 0);
@@ -360,6 +424,12 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     
     history_save_timer = lv_timer_create(history_save_cb, 5000, this);
 
+    #if defined(TPAGER_TARGET)
+    const char* logo =
+        "PocketSSH T-Pager\n"
+        "Type 'help' for commands.\n"
+        "Start with: connect <SSID> <PASSWORD>\n\n";
+    #else
     const char* logo = 
         "\n"
         "  ================================================\n"
@@ -375,6 +445,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
         "   clear - Clear screen | help - Show help\n"
         "\n"
         "  Ready. Type 'connect' to start...\n\n";
+    #endif
     
     lv_textarea_set_text(terminal_output, logo);
 
@@ -707,9 +778,9 @@ void SSHTerminal::battery_update_cb(lv_timer_t* timer)
 {
     SSHTerminal* terminal = (SSHTerminal*)lv_timer_get_user_data(timer);
     if (terminal) {
-        if (bsp_display_lock(0)) {
+        if (display_lock(0)) {
             terminal->update_status_bar();
-            bsp_display_unlock();
+            display_unlock();
         }
     }
 }
@@ -1309,10 +1380,10 @@ esp_err_t SSHTerminal::disconnect()
 
     libssh2_exit();
     
-    if (bsp_display_lock(0)) {
+    if (display_lock(0)) {
         update_status_bar();
         append_text("\nDisconnected\n");
-        bsp_display_unlock();
+        display_unlock();
     }
     
     ESP_LOGI(TAG, "Disconnected");
@@ -1332,9 +1403,9 @@ void SSHTerminal::send_command(const char* cmd)
     }
     
     bytes_received = 0;
-    if (byte_counter_label && bsp_display_lock(0)) {
+    if (byte_counter_label && display_lock(0)) {
         lv_label_set_text(byte_counter_label, "0 B");
-        bsp_display_unlock();
+        display_unlock();
     }
 
     std::string full_cmd = std::string(cmd) + "\n";
@@ -1479,11 +1550,11 @@ void SSHTerminal::flush_display_buffer()
     size_t offset = 0;
     
     while (offset < text_buffer.size()) {
-        if (bsp_display_lock(0)) {
+        if (display_lock(0)) {
             size_t chunk_len = std::min(CHUNK_SIZE, text_buffer.size() - offset);
             std::string chunk = text_buffer.substr(offset, chunk_len);
             append_text(chunk.c_str());
-            bsp_display_unlock();
+            display_unlock();
             offset += chunk_len;
             
             vTaskDelay(1);
@@ -1496,7 +1567,7 @@ void SSHTerminal::flush_display_buffer()
         text_buffer = text_buffer.substr(offset);
     }
     
-    if (bytes_received > 0 && byte_counter_label && bsp_display_lock(0)) {
+    if (bytes_received > 0 && byte_counter_label && display_lock(0)) {
         char counter_text[32];
         if (bytes_received < 1024) {
             snprintf(counter_text, sizeof(counter_text), "%zu B", bytes_received);
@@ -1506,7 +1577,7 @@ void SSHTerminal::flush_display_buffer()
             snprintf(counter_text, sizeof(counter_text), "%.2f MB", bytes_received / (1024.0 * 1024.0));
         }
         lv_label_set_text(byte_counter_label, counter_text);
-        bsp_display_unlock();
+        display_unlock();
     }
     
     if (text_buffer.empty()) {
@@ -1520,7 +1591,7 @@ void SSHTerminal::update_status_bar()
 {
     if (!status_bar) return;
     
-    if (!bsp_display_lock(0)) {
+    if (!display_lock(0)) {
         return;
     }
 
@@ -1553,7 +1624,7 @@ void SSHTerminal::update_status_bar()
     
     lv_label_set_text(status_bar, status.c_str());
     
-    bsp_display_unlock();
+    display_unlock();
 }
 
 void SSHTerminal::update_terminal_display()

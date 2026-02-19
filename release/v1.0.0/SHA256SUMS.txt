@@ -1,0 +1,3 @@
+4b3e076f9d447360fdff4a2f68210eac7ac5f95d0e16a0e796387c7b9a4729cb  PocketSSH-tpager-v1.0.0-clean.bin
+473106f53b48af19abfe50c03a7d5732c6798486fb6fb6cbdd0eaa5a01041b52  bootloader.bin
+00116cf33b26007c148f76e4ef9c95f80b57d895adf113ec10ba921ec10651e0  partition-table.bin

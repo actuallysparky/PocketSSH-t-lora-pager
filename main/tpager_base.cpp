@@ -58,7 +58,6 @@ constexpr const char *kBootWifiPassword = TPAGER_BOOT_WIFI_PASSWORD;
 constexpr const char *kBootSshHost = TPAGER_BOOT_SSH_HOST;
 constexpr int kBootSshPort = TPAGER_BOOT_SSH_PORT;
 constexpr const char *kBootSshUser = TPAGER_BOOT_SSH_USER;
-constexpr const char *kBootSshPassword = TPAGER_BOOT_SSH_PASSWORD;
 constexpr const char *kBootSshMdnsHost = TPAGER_BOOT_SSH_MDNS_HOST;
 constexpr const char *kBootSshKeyfile = TPAGER_BOOT_SSH_KEYFILE;
 
@@ -431,49 +430,25 @@ void wifi_autoconnect_task(void *)
     run_terminal_command("netinfo");
     vTaskDelay(ticks_from_ms(200));
 
-    if (has_value(kBootSshHost) && has_value(kBootSshUser)) {
-        if (has_value(kBootSshKeyfile)) {
-            std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
-                          kBootSshHost, kBootSshPort, kBootSshUser, kBootSshKeyfile);
-            run_terminal_command(cmd);
-            vTaskDelay(ticks_from_ms(250));
-            run_terminal_command("exit");
-            vTaskDelay(ticks_from_ms(200));
-            run_terminal_command("clear");
-            vTaskDelay(ticks_from_ms(120));
-        }
-
-        if (has_value(kBootSshPassword)) {
-            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
-                          kBootSshHost, kBootSshPort, kBootSshUser, kBootSshPassword);
-            run_terminal_command(cmd);
-            vTaskDelay(ticks_from_ms(200));
-        } else {
-            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s ",
-                          kBootSshHost, kBootSshPort, kBootSshUser);
-            append_terminal_text("Auto test: type password, then press Enter\n");
-            run_terminal_input(cmd, false);
-            vTaskDelete(nullptr);
-            return;
-        }
+    if (!has_value(kBootSshUser) || !has_value(kBootSshKeyfile)) {
+        append_terminal_text("Auto test: missing SSH user/keyfile\n");
+        vTaskDelete(nullptr);
+        return;
     }
 
-    if (has_value(kBootSshMdnsHost) && has_value(kBootSshUser)) {
-        if (has_value(kBootSshKeyfile)) {
-            std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
-                          kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshKeyfile);
-            run_terminal_command(cmd);
-            vTaskDelay(ticks_from_ms(250));
-            run_terminal_command("exit");
-            vTaskDelay(ticks_from_ms(200));
-            run_terminal_command("clear");
-            vTaskDelay(ticks_from_ms(120));
-        }
-        if (has_value(kBootSshPassword)) {
-            std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
-                          kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshPassword);
-            run_terminal_command(cmd);
-        }
+    const char *target_host = nullptr;
+    if (has_value(kBootSshHost)) {
+        target_host = kBootSshHost;
+    } else if (has_value(kBootSshMdnsHost)) {
+        target_host = kBootSshMdnsHost;
+    }
+
+    if (target_host != nullptr) {
+        std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
+                      target_host, kBootSshPort, kBootSshUser, kBootSshKeyfile);
+        run_terminal_command(cmd);
+    } else {
+        append_terminal_text("Auto test: missing SSH host\n");
     }
     vTaskDelete(nullptr);
 }

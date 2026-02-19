@@ -417,6 +417,10 @@ bool SSHTerminal::is_wifi_connected()
 
 lv_obj_t* SSHTerminal::create_terminal_screen()
 {
+    // Keep a minimal side inset so the 1px border is fully visible on panel edges
+    // while maximizing horizontal character columns on the T-Pager display.
+    constexpr int kTPagerHorizontalInsetPx = 1;
+
     terminal_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(terminal_screen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(terminal_screen, LV_OPA_COVER, 0);
@@ -452,7 +456,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
 
     terminal_output = lv_textarea_create(terminal_screen);
     #if defined(TPAGER_TARGET)
-    lv_obj_set_size(terminal_output, lv_pct(100) - 8, lv_pct(76));
+    lv_obj_set_size(terminal_output, lv_pct(100) - (kTPagerHorizontalInsetPx * 2), lv_pct(76));
     lv_obj_align(terminal_output, LV_ALIGN_TOP_MID, 0, 18);
     #else
     lv_obj_set_size(terminal_output, lv_pct(100), lv_pct(75));
@@ -487,7 +491,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
 
     lv_obj_t* input_container = lv_obj_create(terminal_screen);
     #if defined(TPAGER_TARGET)
-    lv_obj_set_size(input_container, lv_pct(100) - 8, 22);
+    lv_obj_set_size(input_container, lv_pct(100) - (kTPagerHorizontalInsetPx * 2), 22);
     #else
     lv_obj_set_size(input_container, lv_pct(100) - 10, 25);
     #endif
@@ -497,7 +501,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     lv_obj_set_scrollbar_mode(input_container, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(input_container, LV_DIR_HOR);
     #if defined(TPAGER_TARGET)
-    lv_obj_align(input_container, LV_ALIGN_BOTTOM_LEFT, 4, -2);
+    lv_obj_align(input_container, LV_ALIGN_BOTTOM_MID, 0, -2);
     #else
     lv_obj_align(input_container, LV_ALIGN_BOTTOM_LEFT, 5, -5);
     #endif

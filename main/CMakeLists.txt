@@ -5,6 +5,7 @@ if(TPAGER_DIAG)
     # Diagnostic firmware is intentionally minimal so hardware bring-up loops are fast.
     set(SOURCES
         "tpager_diag.cpp"
+        "tpager_xl9555.cpp"
     )
 else()
     set(SOURCES

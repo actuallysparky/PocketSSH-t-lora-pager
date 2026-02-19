@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "tpager_xl9555.hpp"
 
 namespace {
 
@@ -31,16 +32,7 @@ constexpr gpio_num_t kI2CSda = GPIO_NUM_3;
 constexpr gpio_num_t kI2CScl = GPIO_NUM_2;
 constexpr uint32_t kI2CFreqHz = 400000;
 
-constexpr uint8_t kXL9555Addr = 0x20;
 constexpr uint8_t kTCA8418Addr = 0x34;
-
-constexpr uint8_t kXL9555RegInput0 = 0x00;
-constexpr uint8_t kXL9555RegOutput0 = 0x02;
-constexpr uint8_t kXL9555RegConfig0 = 0x06;
-
-constexpr uint8_t kXL9555PinKbReset = 2;
-constexpr uint8_t kXL9555PinKbPowerPrimary = 10;  // Pin map table
-constexpr uint8_t kXL9555PinKbPowerFallback = 8;  // Power table
 
 constexpr gpio_num_t kEncoderA = GPIO_NUM_40;
 constexpr gpio_num_t kEncoderB = GPIO_NUM_41;
@@ -53,6 +45,7 @@ constexpr TickType_t ticks_from_ms(uint32_t ms)
 }
 
 constexpr TickType_t kI2CTimeoutTicks = ticks_from_ms(20);
+tpager::Xl9555 g_xl9555;
 
 esp_err_t i2c_init()
 {
@@ -93,53 +86,6 @@ esp_err_t i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *value)
     return i2c_master_write_read_device(kI2CPort, addr, &reg, 1, value, 1, kI2CTimeoutTicks);
 }
 
-esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
-{
-    uint8_t data[2] = {reg, value};
-    return i2c_master_write_to_device(kI2CPort, addr, data, sizeof(data), kI2CTimeoutTicks);
-}
-
-esp_err_t xl9555_set_dir(uint8_t pin, bool output)
-{
-    if (pin > 15) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint8_t reg = static_cast<uint8_t>(kXL9555RegConfig0 + (pin / 8));
-    uint8_t bit = static_cast<uint8_t>(1U << (pin % 8));
-    uint8_t cfg = 0;
-    ESP_RETURN_ON_ERROR(i2c_read_reg(kXL9555Addr, reg, &cfg), kTag, "XL9555 dir read failed");
-
-    // XL9555: 1=input, 0=output
-    cfg = output ? static_cast<uint8_t>(cfg & ~bit) : static_cast<uint8_t>(cfg | bit);
-    return i2c_write_reg(kXL9555Addr, reg, cfg);
-}
-
-esp_err_t xl9555_write_pin(uint8_t pin, bool level)
-{
-    if (pin > 15) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint8_t reg = static_cast<uint8_t>(kXL9555RegOutput0 + (pin / 8));
-    uint8_t bit = static_cast<uint8_t>(1U << (pin % 8));
-    uint8_t out = 0;
-    ESP_RETURN_ON_ERROR(i2c_read_reg(kXL9555Addr, reg, &out), kTag, "XL9555 out read failed");
-    out = level ? static_cast<uint8_t>(out | bit) : static_cast<uint8_t>(out & ~bit);
-    return i2c_write_reg(kXL9555Addr, reg, out);
-}
-
-esp_err_t xl9555_read_pin(uint8_t pin, bool *level)
-{
-    if (pin > 15 || level == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint8_t reg = static_cast<uint8_t>(kXL9555RegInput0 + (pin / 8));
-    uint8_t bit = static_cast<uint8_t>(1U << (pin % 8));
-    uint8_t in = 0;
-    ESP_RETURN_ON_ERROR(i2c_read_reg(kXL9555Addr, reg, &in), kTag, "XL9555 in read failed");
-    *level = (in & bit) != 0;
-    return ESP_OK;
-}
-
 void diag_i2c_scan()
 {
     ESP_LOGI(kTag, "diag_i2c_scan: start");
@@ -158,14 +104,14 @@ void diag_i2c_scan()
 void diag_xl9555_dump()
 {
     ESP_LOGI(kTag, "diag_xl9555_dump: start");
-    for (uint8_t reg = 0x00; reg <= 0x07; ++reg) {
-        uint8_t value = 0;
-        esp_err_t ret = i2c_read_reg(kXL9555Addr, reg, &value);
-        if (ret == ESP_OK) {
-            ESP_LOGI(kTag, "diag_xl9555_dump: reg[0x%02X] = 0x%02X", reg, value);
-        } else {
-            ESP_LOGW(kTag, "diag_xl9555_dump: reg[0x%02X] read failed: %s", reg, esp_err_to_name(ret));
-        }
+    uint8_t regs[8] = {};
+    esp_err_t ret = tpager::xl9555_dump_regs(g_xl9555, regs);
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "diag_xl9555_dump: read failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    for (uint8_t reg = 0; reg < 8; ++reg) {
+        ESP_LOGI(kTag, "diag_xl9555_dump: reg[0x%02X] = 0x%02X", reg, regs[reg]);
         vTaskDelay(1);
     }
     ESP_LOGI(kTag, "diag_xl9555_dump: done");
@@ -191,20 +137,21 @@ bool probe_tca8418(uint8_t *cfg_out)
 bool diag_keyboard_reset(uint8_t kb_power_pin)
 {
     ESP_LOGI(kTag, "diag_keyboard_reset: trying power pin XL9555 GPIO%u, reset pin GPIO%u",
-             kb_power_pin, kXL9555PinKbReset);
+             kb_power_pin, tpager::XL9555_PIN_KB_RESET);
 
-    if (xl9555_set_dir(kXL9555PinKbReset, true) != ESP_OK || xl9555_set_dir(kb_power_pin, true) != ESP_OK) {
+    if (tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_KB_RESET, true) != ESP_OK ||
+        tpager::xl9555_set_dir(g_xl9555, kb_power_pin, true) != ESP_OK) {
         ESP_LOGE(kTag, "diag_keyboard_reset: failed to configure XL9555 pin directions");
         return false;
     }
 
     // Deterministic power/reset sequence before probing the controller.
-    ESP_ERROR_CHECK_WITHOUT_ABORT(xl9555_write_pin(kb_power_pin, false));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(xl9555_write_pin(kXL9555PinKbReset, false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, kb_power_pin, false));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_KB_RESET, false));
     vTaskDelay(ticks_from_ms(30));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(xl9555_write_pin(kb_power_pin, true));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, kb_power_pin, true));
     vTaskDelay(ticks_from_ms(30));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(xl9555_write_pin(kXL9555PinKbReset, true));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_KB_RESET, true));
     vTaskDelay(ticks_from_ms(30));
 
     for (int attempt = 1; attempt <= 5; ++attempt) {
@@ -286,27 +233,28 @@ void run_diag()
 {
     ESP_LOGI(kTag, "===== T-PAGER DIAGNOSTIC BOOT =====");
     ESP_LOGI(kTag, "I2C: SDA=%d SCL=%d @ %" PRIu32 "Hz", kI2CSda, kI2CScl, kI2CFreqHz);
-    ESP_LOGI(kTag, "Expected I2C devices: XL9555@0x%02X, TCA8418@0x%02X", kXL9555Addr, kTCA8418Addr);
+    ESP_LOGI(kTag, "Expected I2C devices: XL9555@0x%02X, TCA8418@0x%02X", g_xl9555.address, kTCA8418Addr);
     ESP_LOGI(kTag, "Encoder: A=%d B=%d Center=%d", kEncoderA, kEncoderB, kEncoderCenter);
 
     ESP_ERROR_CHECK(i2c_init());
+    ESP_ERROR_CHECK(tpager::xl9555_init(&g_xl9555, kI2CPort, 0x20, kI2CTimeoutTicks));
     diag_i2c_scan();
 
-    if (i2c_probe(kXL9555Addr) != ESP_OK) {
-        ESP_LOGE(kTag, "XL9555 not detected at 0x%02X; keyboard reset/power diagnostics skipped", kXL9555Addr);
+    if (tpager::xl9555_probe(g_xl9555) != ESP_OK) {
+        ESP_LOGE(kTag, "XL9555 not detected at 0x%02X; keyboard reset/power diagnostics skipped", g_xl9555.address);
     } else {
         diag_xl9555_dump();
 
         ESP_LOGW(kTag,
                  "LilyGo docs conflict for keyboard power gate (GPIO10 vs GPIO8). Trying GPIO10 first, then GPIO8.");
-        bool keyboard_ok = diag_keyboard_reset(kXL9555PinKbPowerPrimary);
+        bool keyboard_ok = diag_keyboard_reset(tpager::XL9555_PIN_KB_POWER_EN_PRIMARY);
         if (!keyboard_ok) {
-            keyboard_ok = diag_keyboard_reset(kXL9555PinKbPowerFallback);
+            keyboard_ok = diag_keyboard_reset(tpager::XL9555_PIN_KB_POWER_EN_FALLBACK);
         }
         ESP_LOGI(kTag, "diag_keyboard_reset: result=%s", keyboard_ok ? "PASS" : "FAIL");
 
         bool kb_reset_level = false;
-        if (xl9555_read_pin(kXL9555PinKbReset, &kb_reset_level) == ESP_OK) {
+        if (tpager::xl9555_read_pin(g_xl9555, tpager::XL9555_PIN_KB_RESET, &kb_reset_level) == ESP_OK) {
             ESP_LOGI(kTag, "diag_keyboard_reset: reset pin level=%d", kb_reset_level ? 1 : 0);
         }
     }

@@ -22,6 +22,7 @@
 #include "lwip/netdb.h"
 #if defined(TPAGER_TARGET)
 #include "esp_lvgl_port.h"
+#include "tpager_sd.hpp"
 #else
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
@@ -110,6 +111,37 @@ static esp_event_handler_instance_t s_instance_any_id = NULL;
 static esp_event_handler_instance_t s_instance_got_ip = NULL;
 
 namespace {
+#if defined(TPAGER_TARGET)
+class ScopedSDMount {
+public:
+    ScopedSDMount()
+    {
+        tpager::SdDiagStats stats = {};
+        const esp_err_t ret = tpager::sd_mount_and_scan_keys(&stats);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to mount SD for runtime file access: %s", esp_err_to_name(ret));
+            ok_ = false;
+            return;
+        }
+        mounted_ = true;
+    }
+
+    ~ScopedSDMount()
+    {
+        if (!mounted_) {
+            return;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
+    }
+
+    bool ok() const { return ok_; }
+
+private:
+    bool ok_ = true;
+    bool mounted_ = false;
+};
+#endif
+
 constexpr const char *kSshConfigPath = "/sdcard/ssh_keys/ssh_config";
 constexpr const char *kSshKeysRoot = "/sdcard/ssh_keys/";
 
@@ -609,6 +641,13 @@ bool parse_ssh_config_file(SSHConfigFile *parsed)
 
     *parsed = {};
 
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        return false;
+    }
+#endif
+
     FILE *file = std::fopen(kSshConfigPath, "r");
     if (file == nullptr) {
         return false;
@@ -712,6 +751,13 @@ bool read_file_contents(const std::string &path, std::string *contents)
     if (contents == nullptr) {
         return false;
     }
+
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        return false;
+    }
+#endif
 
     FILE *file = std::fopen(path.c_str(), "rb");
     if (file == nullptr) {

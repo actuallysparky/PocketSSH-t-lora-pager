@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "tpager_tca8418.hpp"
 #include "tpager_xl9555.hpp"
 
 namespace {
@@ -33,6 +34,7 @@ constexpr gpio_num_t kI2CScl = GPIO_NUM_2;
 constexpr uint32_t kI2CFreqHz = 400000;
 
 constexpr uint8_t kTCA8418Addr = 0x34;
+constexpr gpio_num_t kKeyboardIrq = GPIO_NUM_6;
 
 constexpr gpio_num_t kEncoderA = GPIO_NUM_40;
 constexpr gpio_num_t kEncoderB = GPIO_NUM_41;
@@ -46,6 +48,8 @@ constexpr TickType_t ticks_from_ms(uint32_t ms)
 
 constexpr TickType_t kI2CTimeoutTicks = ticks_from_ms(20);
 tpager::Xl9555 g_xl9555;
+tpager::Tca8418 g_tca8418;
+tpager::Tca8418State g_tca8418_state;
 
 esp_err_t i2c_init()
 {
@@ -119,7 +123,7 @@ void diag_xl9555_dump()
 
 bool probe_tca8418(uint8_t *cfg_out)
 {
-    if (i2c_probe(kTCA8418Addr) != ESP_OK) {
+    if (tpager::tca8418_probe(g_tca8418) != ESP_OK) {
         return false;
     }
     uint8_t cfg = 0;
@@ -132,6 +136,102 @@ bool probe_tca8418(uint8_t *cfg_out)
         *cfg_out = cfg;
     }
     return true;
+}
+
+const char *key_name(tpager::Tca8418Key key)
+{
+    switch (key) {
+    case tpager::Tca8418Key::Character:
+        return "CHAR";
+    case tpager::Tca8418Key::Enter:
+        return "ENTER";
+    case tpager::Tca8418Key::Backspace:
+        return "BACKSPACE";
+    case tpager::Tca8418Key::Alt:
+        return "ALT";
+    case tpager::Tca8418Key::Caps:
+        return "CAPS";
+    case tpager::Tca8418Key::Symbol:
+        return "SYMBOL";
+    case tpager::Tca8418Key::Space:
+        return "SPACE";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+void diag_keyboard_events(uint32_t sample_ms)
+{
+    ESP_LOGI(kTag, "diag_keyboard_events: init matrix=4x10 (polling mode, IRQ pin=%d)", kKeyboardIrq);
+    ESP_ERROR_CHECK(tpager::tca8418_configure_matrix(&g_tca8418, 4, 10));
+    ESP_ERROR_CHECK(tpager::tca8418_flush_fifo(g_tca8418));
+
+    gpio_config_t irq_cfg = {};
+    irq_cfg.mode = GPIO_MODE_INPUT;
+    irq_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    irq_cfg.pin_bit_mask = (1ULL << kKeyboardIrq);
+    ESP_ERROR_CHECK(gpio_config(&irq_cfg));
+
+    ESP_LOGI(kTag, "diag_keyboard_events: sampling for %" PRIu32 " ms; press a few keys now", sample_ms);
+    int64_t start_us = esp_timer_get_time();
+    int64_t last_report_us = start_us;
+    int32_t events = 0;
+    int32_t presses = 0;
+    int32_t releases = 0;
+
+    while ((esp_timer_get_time() - start_us) < static_cast<int64_t>(sample_ms) * 1000) {
+        tpager::Tca8418Event ev = {};
+        esp_err_t ret = tpager::tca8418_poll_event(g_tca8418, &g_tca8418_state, &ev);
+        if (ret == ESP_OK && ev.valid) {
+            ++events;
+            if (ev.pressed) {
+                ++presses;
+            } else {
+                ++releases;
+            }
+
+            if (ev.is_gpio) {
+                ESP_LOGI(kTag, "diag_keyboard_events: GPIO event raw=0x%02X %s", ev.raw,
+                         ev.pressed ? "PRESSED" : "RELEASED");
+            } else {
+                if (ev.ch == '\n') {
+                    ESP_LOGI(kTag,
+                             "diag_keyboard_events: raw=0x%02X code=%u row=%u col=%u %s key=%s ch=\\n",
+                             ev.raw, ev.code, ev.row, ev.col, ev.pressed ? "PRESSED" : "RELEASED",
+                             key_name(ev.key));
+                } else if (ev.ch == '\b') {
+                    ESP_LOGI(kTag,
+                             "diag_keyboard_events: raw=0x%02X code=%u row=%u col=%u %s key=%s ch=\\b",
+                             ev.raw, ev.code, ev.row, ev.col, ev.pressed ? "PRESSED" : "RELEASED",
+                             key_name(ev.key));
+                } else if (ev.ch != '\0') {
+                    ESP_LOGI(kTag,
+                             "diag_keyboard_events: raw=0x%02X code=%u row=%u col=%u %s key=%s ch='%c'",
+                             ev.raw, ev.code, ev.row, ev.col, ev.pressed ? "PRESSED" : "RELEASED",
+                             key_name(ev.key), ev.ch);
+                } else {
+                    ESP_LOGI(kTag,
+                             "diag_keyboard_events: raw=0x%02X code=%u row=%u col=%u %s key=%s",
+                             ev.raw, ev.code, ev.row, ev.col, ev.pressed ? "PRESSED" : "RELEASED",
+                             key_name(ev.key));
+                }
+            }
+        } else if (ret != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(kTag, "diag_keyboard_events: poll error: %s", esp_err_to_name(ret));
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_report_us) >= 1000000) {
+            int irq_level = gpio_get_level(kKeyboardIrq);
+            ESP_LOGI(kTag, "diag_keyboard_events: irq=%d events=%" PRId32 " (p=%" PRId32 ", r=%" PRId32 ")",
+                     irq_level, events, presses, releases);
+            last_report_us = now_us;
+        }
+        vTaskDelay(1);
+    }
+
+    ESP_LOGI(kTag, "diag_keyboard_events: done events=%" PRId32 " (p=%" PRId32 ", r=%" PRId32 ")",
+             events, presses, releases);
 }
 
 bool diag_keyboard_reset(uint8_t kb_power_pin)
@@ -238,6 +338,7 @@ void run_diag()
 
     ESP_ERROR_CHECK(i2c_init());
     ESP_ERROR_CHECK(tpager::xl9555_init(&g_xl9555, kI2CPort, 0x20, kI2CTimeoutTicks));
+    ESP_ERROR_CHECK(tpager::tca8418_init(&g_tca8418, kI2CPort, kTCA8418Addr, kI2CTimeoutTicks));
     diag_i2c_scan();
 
     if (tpager::xl9555_probe(g_xl9555) != ESP_OK) {
@@ -256,6 +357,11 @@ void run_diag()
         bool kb_reset_level = false;
         if (tpager::xl9555_read_pin(g_xl9555, tpager::XL9555_PIN_KB_RESET, &kb_reset_level) == ESP_OK) {
             ESP_LOGI(kTag, "diag_keyboard_reset: reset pin level=%d", kb_reset_level ? 1 : 0);
+        }
+
+        if (keyboard_ok) {
+            // Polling-first per bring-up strategy. IRQ observation is logged as telemetry only.
+            diag_keyboard_events(10000);
         }
     }
 

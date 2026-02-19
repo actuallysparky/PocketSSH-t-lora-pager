@@ -6,6 +6,7 @@ if(TPAGER_DIAG)
     set(SOURCES
         "tpager_diag.cpp"
         "tpager_xl9555.cpp"
+        "tpager_tca8418.cpp"
     )
 else()
     set(SOURCES

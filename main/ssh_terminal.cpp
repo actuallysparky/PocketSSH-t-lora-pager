@@ -132,6 +132,26 @@ bool resolve_host_ipv4(const char *host, int port, struct sockaddr_in *out_addr)
     freeaddrinfo(results);
     return ok;
 }
+
+std::vector<std::string> split_nonempty_whitespace(const std::string &input)
+{
+    std::vector<std::string> parts;
+    std::string token;
+    for (char c : input) {
+        if (c == ' ' || c == '\t') {
+            if (!token.empty()) {
+                parts.push_back(token);
+                token.clear();
+            }
+            continue;
+        }
+        token.push_back(c);
+    }
+    if (!token.empty()) {
+        parts.push_back(token);
+    }
+    return parts;
+}
 } // namespace
 
 SSHTerminal::SSHTerminal() 
@@ -595,15 +615,7 @@ void SSHTerminal::handle_key_input(char key)
                 }
             }
             else if (current_input.rfind("ssh ", 0) == 0) {
-                std::vector<std::string> parts;
-                size_t pos = 0;
-                std::string temp = current_input;
-                
-                while ((pos = temp.find(' ')) != std::string::npos) {
-                    parts.push_back(temp.substr(0, pos));
-                    temp.erase(0, pos + 1);
-                }
-                parts.push_back(temp);
+                std::vector<std::string> parts = split_nonempty_whitespace(current_input);
                 
                 if (parts.size() >= 5) {
                     std::string host = parts[1];
@@ -617,15 +629,7 @@ void SSHTerminal::handle_key_input(char key)
                 }
             }
             else if (current_input.rfind("sshkey ", 0) == 0) {
-                std::vector<std::string> parts;
-                size_t pos = 0;
-                std::string temp = current_input;
-                
-                while ((pos = temp.find(' ')) != std::string::npos) {
-                    parts.push_back(temp.substr(0, pos));
-                    temp.erase(0, pos + 1);
-                }
-                parts.push_back(temp);
+                std::vector<std::string> parts = split_nonempty_whitespace(current_input);
                 
                 if (parts.size() >= 5) {
                     std::string host = parts[1];

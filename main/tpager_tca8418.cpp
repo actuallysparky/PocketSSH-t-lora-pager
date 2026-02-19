@@ -18,7 +18,8 @@ constexpr uint8_t kRegKpGpio3 = 0x1F;
 constexpr uint8_t kCfgAi = 1U << 0;
 constexpr uint8_t kIntKey = 1U << 0;
 constexpr uint8_t kEventCountMask = 0x0F;
-constexpr int64_t kSpaceDebounceUs = 70000;
+constexpr int64_t kSpaceDebounceUs = 15000;
+constexpr int64_t kSpaceReleaseFallbackUs = 40000;
 
 // T-LoRa Pager keyboard map from LilyGo reference firmware.
 constexpr char kKeymap[4][10] = {
@@ -83,6 +84,19 @@ bool should_emit_space(tpager::Tca8418State *state)
     }
     const int64_t now_us = esp_timer_get_time();
     if (now_us - state->last_space_emit_us < kSpaceDebounceUs) {
+        return false;
+    }
+    state->last_space_emit_us = now_us;
+    return true;
+}
+
+bool should_emit_space_release_fallback(tpager::Tca8418State *state)
+{
+    if (state == nullptr) {
+        return false;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - state->last_space_emit_us < kSpaceReleaseFallbackUs) {
         return false;
     }
     state->last_space_emit_us = now_us;
@@ -225,20 +239,19 @@ esp_err_t tca8418_poll_event(const Tca8418 &dev, Tca8418State *state, Tca8418Eve
     if (event->matrix_index == kKeyIndexSpace) {
         event->key = Tca8418Key::Space;
         event->ch = ' ';
-        if (should_emit_space(state)) {
+        if (event->pressed && should_emit_space(state)) {
             event->pressed = true;
+        } else if (!event->pressed && should_emit_space_release_fallback(state)) {
+            event->pressed = true;
+        } else {
+            event->pressed = false;
         }
         return ESP_OK;
     }
 
-    // Modifier handling follows reference firmware semantics (toggle on press).
-    if (event->pressed) {
-        if (event->matrix_index == kKeyIndexCaps) {
-            state->caps = !state->caps;
-        }
-    }
-
+    // Caps is treated as momentary shift for this target.
     if (event->matrix_index == kKeyIndexCaps) {
+        state->caps = event->pressed;
         event->key = Tca8418Key::Caps;
         return ESP_OK;
     }

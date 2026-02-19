@@ -55,11 +55,6 @@ constexpr gpio_num_t kEncoderCenter = GPIO_NUM_7;
 constexpr bool kBootAutoTestHook = (TPAGER_BOOT_TEST_ENABLE != 0);
 constexpr const char *kBootWifiSsid = TPAGER_BOOT_WIFI_SSID;
 constexpr const char *kBootWifiPassword = TPAGER_BOOT_WIFI_PASSWORD;
-constexpr const char *kBootSshHost = TPAGER_BOOT_SSH_HOST;
-constexpr int kBootSshPort = TPAGER_BOOT_SSH_PORT;
-constexpr const char *kBootSshUser = TPAGER_BOOT_SSH_USER;
-constexpr const char *kBootSshMdnsHost = TPAGER_BOOT_SSH_MDNS_HOST;
-constexpr const char *kBootSshKeyfile = TPAGER_BOOT_SSH_KEYFILE;
 
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
@@ -428,28 +423,7 @@ void wifi_autoconnect_task(void *)
     run_terminal_command(cmd);
     vTaskDelay(ticks_from_ms(200));
     run_terminal_command("netinfo");
-    vTaskDelay(ticks_from_ms(200));
-
-    if (!has_value(kBootSshUser) || !has_value(kBootSshKeyfile)) {
-        append_terminal_text("Auto test: missing SSH user/keyfile\n");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    const char *target_host = nullptr;
-    if (has_value(kBootSshHost)) {
-        target_host = kBootSshHost;
-    } else if (has_value(kBootSshMdnsHost)) {
-        target_host = kBootSshMdnsHost;
-    }
-
-    if (target_host != nullptr) {
-        std::snprintf(cmd, sizeof(cmd), "sshkey %s %d %s %s",
-                      target_host, kBootSshPort, kBootSshUser, kBootSshKeyfile);
-        run_terminal_command(cmd);
-    } else {
-        append_terminal_text("Auto test: missing SSH host\n");
-    }
+    append_terminal_text("Auto test hook complete (WiFi only)\n");
     vTaskDelete(nullptr);
 }
 

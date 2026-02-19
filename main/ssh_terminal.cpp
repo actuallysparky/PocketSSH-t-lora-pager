@@ -91,6 +91,49 @@ static int s_retry_num = 0;
 static esp_event_handler_instance_t s_instance_any_id = NULL;
 static esp_event_handler_instance_t s_instance_got_ip = NULL;
 
+namespace {
+bool resolve_host_ipv4(const char *host, int port, struct sockaddr_in *out_addr)
+{
+    if (host == nullptr || out_addr == nullptr || port <= 0 || port > 65535) {
+        return false;
+    }
+
+    std::memset(out_addr, 0, sizeof(*out_addr));
+    out_addr->sin_family = AF_INET;
+    out_addr->sin_port = htons(port);
+
+    // Fast path: literal IPv4 string.
+    if (inet_pton(AF_INET, host, &out_addr->sin_addr) == 1) {
+        return true;
+    }
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *results = nullptr;
+    int rc = getaddrinfo(host, nullptr, &hints, &results);
+    if (rc != 0 || results == nullptr) {
+        ESP_LOGE(TAG, "DNS lookup failed for %s: %d", host, rc);
+        return false;
+    }
+
+    bool ok = false;
+    for (struct addrinfo *it = results; it != nullptr; it = it->ai_next) {
+        if (it->ai_family != AF_INET || it->ai_addrlen < static_cast<int>(sizeof(struct sockaddr_in))) {
+            continue;
+        }
+        auto *sin = reinterpret_cast<struct sockaddr_in *>(it->ai_addr);
+        out_addr->sin_addr = sin->sin_addr;
+        ok = true;
+        break;
+    }
+    freeaddrinfo(results);
+    return ok;
+}
+} // namespace
+
 SSHTerminal::SSHTerminal() 
     : terminal_screen(NULL), 
       terminal_output(NULL), 
@@ -1103,9 +1146,14 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
         return ESP_FAIL;
     }
 
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(port);
-    sin.sin_addr.s_addr = inet_addr(host);
+    if (!resolve_host_ipv4(host, port, &sin)) {
+        ESP_LOGE(TAG, "Failed to resolve host: %s", host);
+        append_text("ERROR: Failed to resolve host\n");
+        close(ssh_socket);
+        ssh_socket = -1;
+        libssh2_exit();
+        return ESP_FAIL;
+    }
 
     struct timeval timeout;
     timeout.tv_sec = 10;
@@ -1202,9 +1250,14 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
         return ESP_FAIL;
     }
 
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(port);
-    sin.sin_addr.s_addr = inet_addr(host);
+    if (!resolve_host_ipv4(host, port, &sin)) {
+        ESP_LOGE(TAG, "Failed to resolve host: %s", host);
+        append_text("ERROR: Failed to resolve host\n");
+        close(ssh_socket);
+        ssh_socket = -1;
+        libssh2_exit();
+        return ESP_FAIL;
+    }
 
     struct timeval timeout;
     timeout.tv_sec = 10;

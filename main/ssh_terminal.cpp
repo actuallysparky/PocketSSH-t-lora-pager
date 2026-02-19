@@ -35,6 +35,8 @@
 #include <cstdio>
 #include <limits>
 #include <set>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -144,6 +146,7 @@ private:
 
 constexpr const char *kSshConfigPath = "/sdcard/ssh_keys/ssh_config";
 constexpr const char *kSshKeysRoot = "/sdcard/ssh_keys/";
+constexpr const char *kSshKeysDir = "/sdcard/ssh_keys";
 
 struct SSHConfigOptions {
     bool has_host_name = false;
@@ -633,6 +636,59 @@ void merge_options(const SSHConfigOptions &source, SSHConfigOptions *target)
     }
 }
 
+bool path_exists_regular_file(const std::string &path)
+{
+    struct stat st = {};
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISREG(st.st_mode);
+}
+
+std::string resolve_ssh_config_path()
+{
+    const std::string preferred = kSshConfigPath;
+    if (path_exists_regular_file(preferred)) {
+        return preferred;
+    }
+
+    DIR *dir = opendir(kSshKeysDir);
+    if (dir == nullptr) {
+        ESP_LOGW(TAG, "ssh_config resolve: unable to open %s (errno=%d %s)",
+                 kSshKeysDir, errno, strerror(errno));
+        return preferred;
+    }
+
+    std::string best_match;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string lower = lowercase_ascii(name);
+        if (lower == "ssh_config") {
+            best_match = std::string(kSshKeysDir) + "/" + name;
+            break;
+        }
+        if (lower.rfind("ssh_config", 0) == 0 ||
+            lower.rfind("ssh_co~", 0) == 0 ||
+            lower.rfind("sshcon", 0) == 0) {
+            best_match = std::string(kSshKeysDir) + "/" + name;
+        }
+    }
+    closedir(dir);
+
+    if (!best_match.empty()) {
+        ESP_LOGW(TAG, "ssh_config resolve: using fallback path %s", best_match.c_str());
+        return best_match;
+    }
+
+    ESP_LOGW(TAG, "ssh_config resolve: no candidate in %s, expected %s",
+             kSshKeysDir, preferred.c_str());
+    return preferred;
+}
+
 bool parse_ssh_config_file(SSHConfigFile *parsed)
 {
     if (parsed == nullptr) {
@@ -648,10 +704,14 @@ bool parse_ssh_config_file(SSHConfigFile *parsed)
     }
 #endif
 
-    FILE *file = std::fopen(kSshConfigPath, "r");
+    const std::string config_path = resolve_ssh_config_path();
+    FILE *file = std::fopen(config_path.c_str(), "r");
     if (file == nullptr) {
+        ESP_LOGW(TAG, "ssh_config open failed: %s (errno=%d %s)",
+                 config_path.c_str(), errno, strerror(errno));
         return false;
     }
+    ESP_LOGI(TAG, "ssh_config open: %s", config_path.c_str());
 
     std::set<std::string> alias_seen;
     SSHConfigHostBlock *active_host = nullptr;

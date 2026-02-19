@@ -155,6 +155,36 @@ std::vector<std::string> split_nonempty_whitespace(const std::string &input)
 }
 } // namespace
 
+namespace {
+void print_sta_netinfo(SSHTerminal *terminal)
+{
+    if (terminal == nullptr) {
+        return;
+    }
+
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta == nullptr) {
+        terminal->append_text("netinfo: STA netif not initialized\n");
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    esp_err_t rc = esp_netif_get_ip_info(sta, &ip_info);
+    if (rc != ESP_OK) {
+        terminal->append_text("netinfo: failed to read IP info\n");
+        return;
+    }
+
+    char line[96];
+    std::snprintf(line, sizeof(line), "IP      : " IPSTR "\n", IP2STR(&ip_info.ip));
+    terminal->append_text(line);
+    std::snprintf(line, sizeof(line), "Netmask : " IPSTR "\n", IP2STR(&ip_info.netmask));
+    terminal->append_text(line);
+    std::snprintf(line, sizeof(line), "Gateway : " IPSTR "\n", IP2STR(&ip_info.gw));
+    terminal->append_text(line);
+}
+} // namespace
+
 SSHTerminal::SSHTerminal() 
     : terminal_screen(NULL), 
       terminal_output(NULL), 
@@ -693,6 +723,7 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("Available commands:\n");
                 append_text("  connect <SSID> <PASSWORD> - Connect to WiFi\n");
                 append_text("    Use quotes for spaces: connect \"My WiFi\" password\n");
+                append_text("  netinfo - Show WiFi IP/netmask/gateway\n");
                 append_text("  ssh <HOST> <PORT> <USER> <PASS> - Connect via SSH\n");
                 append_text("  sshkey <HOST> <PORT> <USER> <KEYFILE> - Connect via SSH with private key\n");
                 append_text("    Note: Place .pem keys in /sdcard/ssh_keys/ before use\n");
@@ -700,6 +731,13 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("  exit - Disconnect SSH\n");
                 append_text("  clear - Clear terminal\n");
                 append_text("  help - Show this help\n");
+            }
+            else if (current_input == "netinfo") {
+                if (!wifi_connected) {
+                    append_text("WiFi not connected\n");
+                } else {
+                    print_sta_netinfo(this);
+                }
             }
             else if (ssh_connected) {
                 send_command(current_input.c_str());
@@ -1162,6 +1200,7 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
     if (!resolve_host_ipv4(host, port, &sin)) {
         ESP_LOGE(TAG, "Failed to resolve host: %s", host);
         append_text("ERROR: Failed to resolve host\n");
+        append_text("Hint: .local needs mDNS on the same LAN; guest WiFi can block it.\n");
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1186,6 +1225,9 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
         char err_line[96];
         std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
         append_text(err_line);
+        if (err == EHOSTUNREACH || err == ECONNABORTED || err == ENETUNREACH || err == ETIMEDOUT) {
+            append_text("Hint: target likely unreachable from current WiFi/network segment.\n");
+        }
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1275,6 +1317,7 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
     if (!resolve_host_ipv4(host, port, &sin)) {
         ESP_LOGE(TAG, "Failed to resolve host: %s", host);
         append_text("ERROR: Failed to resolve host\n");
+        append_text("Hint: .local needs mDNS on the same LAN; guest WiFi can block it.\n");
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1299,6 +1342,9 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
         char err_line[96];
         std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
         append_text(err_line);
+        if (err == EHOSTUNREACH || err == ECONNABORTED || err == ENETUNREACH || err == ETIMEDOUT) {
+            append_text("Hint: target likely unreachable from current WiFi/network segment.\n");
+        }
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();

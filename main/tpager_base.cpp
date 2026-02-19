@@ -29,6 +29,10 @@
 #include "tpager_encoder.hpp"
 #include "tpager_sd.hpp"
 #include "tpager_tca8418.hpp"
+#if __has_include("tpager_test_hook_config_local.hpp")
+#include "tpager_test_hook_config_local.hpp"
+#endif
+#include "tpager_test_hook_config.hpp"
 #include "tpager_xl9555.hpp"
 
 namespace {
@@ -47,10 +51,15 @@ constexpr gpio_num_t kEncoderA = GPIO_NUM_40;
 constexpr gpio_num_t kEncoderB = GPIO_NUM_41;
 constexpr gpio_num_t kEncoderCenter = GPIO_NUM_7;
 
-// Temporary test hook: auto-connect Wi-Fi at boot to speed SSH validation loops.
-constexpr bool kBootAutoWifiConnect = true;
-constexpr const char *kBootWifiSsid = "REDACTED_WIFI";
-constexpr const char *kBootWifiPassword = "REDACTED_WIFI";
+// Boot test hook credentials are loaded from local gitignored overrides.
+constexpr bool kBootAutoTestHook = (TPAGER_BOOT_TEST_ENABLE != 0);
+constexpr const char *kBootWifiSsid = TPAGER_BOOT_WIFI_SSID;
+constexpr const char *kBootWifiPassword = TPAGER_BOOT_WIFI_PASSWORD;
+constexpr const char *kBootSshHost = TPAGER_BOOT_SSH_HOST;
+constexpr int kBootSshPort = TPAGER_BOOT_SSH_PORT;
+constexpr const char *kBootSshUser = TPAGER_BOOT_SSH_USER;
+constexpr const char *kBootSshPassword = TPAGER_BOOT_SSH_PASSWORD;
+constexpr const char *kBootSshMdnsHost = TPAGER_BOOT_SSH_MDNS_HOST;
 
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
@@ -163,6 +172,47 @@ void handle_terminal_key(char key)
     }
     g_terminal->handle_key_input(key);
     lvgl_port_unlock();
+}
+
+bool inject_terminal_key(char key)
+{
+    if (g_terminal == nullptr) {
+        return false;
+    }
+
+    constexpr int kAttempts = 40;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        if (lvgl_port_lock(25)) {
+            g_terminal->handle_key_input(key);
+            lvgl_port_unlock();
+            return true;
+        }
+        vTaskDelay(ticks_from_ms(5));
+    }
+
+    ESP_LOGW(kTag, "Auto command key injection failed: 0x%02x", static_cast<unsigned char>(key));
+    return false;
+}
+
+bool has_value(const char *s)
+{
+    return s != nullptr && s[0] != '\0';
+}
+
+void run_terminal_command(const char *cmd)
+{
+    if (cmd == nullptr) {
+        return;
+    }
+
+    ESP_LOGI(kTag, "Auto command: %s", cmd);
+    for (const char *p = cmd; *p != '\0'; ++p) {
+        if (!inject_terminal_key(*p)) {
+            break;
+        }
+        vTaskDelay(ticks_from_ms(3));
+    }
+    (void)inject_terminal_key('\n');
 }
 
 bool to_terminal_char(const tpager::Tca8418Event &ev, char *out_key)
@@ -353,18 +403,37 @@ void runtime_task(void *)
 
 void wifi_autoconnect_task(void *)
 {
-    if (!kBootAutoWifiConnect || g_terminal == nullptr) {
+    if (!kBootAutoTestHook || g_terminal == nullptr) {
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (!has_value(kBootWifiSsid) || !has_value(kBootWifiPassword)) {
+        ESP_LOGW(kTag, "Boot test hook enabled without WiFi credentials");
+        append_terminal_text("Auto test hook disabled: missing WiFi credentials\n");
         vTaskDelete(nullptr);
         return;
     }
 
-    vTaskDelay(ticks_from_ms(500));
-    append_terminal_text("Auto WiFi: connecting to REDACTED_WIFI...\n");
-    const esp_err_t ret = g_terminal->init_wifi(kBootWifiSsid, kBootWifiPassword);
-    if (ret == ESP_OK) {
-        append_terminal_text("Auto WiFi: connected\n");
-    } else {
-        append_terminal_text("Auto WiFi: failed\n");
+    vTaskDelay(ticks_from_ms(700));
+    append_terminal_text("Auto test hook start\n");
+    char cmd[192];
+    std::snprintf(cmd, sizeof(cmd), "connect %s %s", kBootWifiSsid, kBootWifiPassword);
+    run_terminal_command(cmd);
+    vTaskDelay(ticks_from_ms(200));
+    run_terminal_command("netinfo");
+    vTaskDelay(ticks_from_ms(200));
+
+    if (has_value(kBootSshHost) && has_value(kBootSshUser)) {
+        std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
+                      kBootSshHost, kBootSshPort, kBootSshUser, kBootSshPassword);
+        run_terminal_command(cmd);
+        vTaskDelay(ticks_from_ms(200));
+    }
+
+    if (has_value(kBootSshMdnsHost) && has_value(kBootSshUser)) {
+        std::snprintf(cmd, sizeof(cmd), "ssh %s %d %s %s",
+                      kBootSshMdnsHost, kBootSshPort, kBootSshUser, kBootSshPassword);
+        run_terminal_command(cmd);
     }
     vTaskDelete(nullptr);
 }
@@ -449,7 +518,7 @@ extern "C" void app_main(void)
 
     load_ssh_keys_from_sd();
 
-    if (kBootAutoWifiConnect) {
+    if (kBootAutoTestHook) {
         xTaskCreatePinnedToCore(wifi_autoconnect_task, "tpager_wifi_auto_task", 6144, nullptr, 4, nullptr, 1);
     }
 

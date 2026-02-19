@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,7 @@
 #endif
 #include <cstring>
 #include <algorithm>
+#include <cinttypes>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -79,6 +81,16 @@ const lv_font_t* ui_font_body()
 #else
     return LV_FONT_DEFAULT;
 #endif
+}
+
+void log_heap_snapshot(const char *stage)
+{
+    const uint32_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    const uint32_t free32 = heap_caps_get_free_size(MALLOC_CAP_32BIT);
+    const uint32_t largest32 = heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
+    ESP_LOGI(TAG, "heap[%s] free8=%" PRIu32 " largest8=%" PRIu32 " free32=%" PRIu32 " largest32=%" PRIu32,
+             stage, free8, largest8, free32, largest32);
 }
 }  // namespace
 
@@ -164,6 +176,7 @@ void print_sta_netinfo(SSHTerminal *terminal)
 
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta == nullptr) {
+        ESP_LOGW(TAG, "netinfo: STA netif not initialized");
         terminal->append_text("netinfo: STA netif not initialized\n");
         return;
     }
@@ -171,16 +184,20 @@ void print_sta_netinfo(SSHTerminal *terminal)
     esp_netif_ip_info_t ip_info = {};
     esp_err_t rc = esp_netif_get_ip_info(sta, &ip_info);
     if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "netinfo: failed to read IP info (%s)", esp_err_to_name(rc));
         terminal->append_text("netinfo: failed to read IP info\n");
         return;
     }
 
     char line[96];
     std::snprintf(line, sizeof(line), "IP      : " IPSTR "\n", IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "netinfo %s", line);
     terminal->append_text(line);
     std::snprintf(line, sizeof(line), "Netmask : " IPSTR "\n", IP2STR(&ip_info.netmask));
+    ESP_LOGI(TAG, "netinfo %s", line);
     terminal->append_text(line);
     std::snprintf(line, sizeof(line), "Gateway : " IPSTR "\n", IP2STR(&ip_info.gw));
+    ESP_LOGI(TAG, "netinfo %s", line);
     terminal->append_text(line);
 }
 } // namespace
@@ -1200,7 +1217,7 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
     if (!resolve_host_ipv4(host, port, &sin)) {
         ESP_LOGE(TAG, "Failed to resolve host: %s", host);
         append_text("ERROR: Failed to resolve host\n");
-        append_text("Hint: .local needs mDNS on the same LAN; guest WiFi can block it.\n");
+        append_text("Hint: .local uses mDNS; guest/VLAN networks often block it. IP/DNS hostname may still work.\n");
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1211,6 +1228,7 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
     append_text("Resolved to ");
     append_text(resolved_ip);
     append_text("\n");
+    ESP_LOGI(TAG, "Resolved %s -> %s", host, resolved_ip);
 
     struct timeval timeout;
     timeout.tv_sec = 10;
@@ -1220,7 +1238,7 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
 
     if (::connect(ssh_socket, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
         const int err = errno;
-        ESP_LOGE(TAG, "Failed to connect socket");
+        ESP_LOGE(TAG, "Failed to connect socket errno=%d (%s)", err, strerror(err));
         append_text("ERROR: Failed to connect socket\n");
         char err_line[96];
         std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
@@ -1236,10 +1254,24 @@ esp_err_t SSHTerminal::connect(const char* host, int port, const char* username,
 
     ESP_LOGI(TAG, "Socket connected");
     append_text("Socket connected, initializing SSH session...\n");
+    log_heap_snapshot("pre_session_init");
 
     session = libssh2_session_init();
     if (!session) {
-        ESP_LOGE(TAG, "Failed to create SSH session");
+        ESP_LOGW(TAG, "Failed to create SSH session, attempting low-memory recovery");
+        append_text("WARN: session alloc failed, clearing terminal and retrying...\n");
+        if (display_lock(50)) {
+            if (terminal_output) {
+                lv_textarea_set_text(terminal_output, "");
+            }
+            display_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        log_heap_snapshot("post_recovery");
+        session = libssh2_session_init();
+    }
+    if (!session) {
+        ESP_LOGE(TAG, "Failed to create SSH session after recovery");
         append_text("ERROR: Failed to create SSH session\n");
         close(ssh_socket);
         ssh_socket = -1;
@@ -1317,7 +1349,7 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
     if (!resolve_host_ipv4(host, port, &sin)) {
         ESP_LOGE(TAG, "Failed to resolve host: %s", host);
         append_text("ERROR: Failed to resolve host\n");
-        append_text("Hint: .local needs mDNS on the same LAN; guest WiFi can block it.\n");
+        append_text("Hint: .local uses mDNS; guest/VLAN networks often block it. IP/DNS hostname may still work.\n");
         close(ssh_socket);
         ssh_socket = -1;
         libssh2_exit();
@@ -1328,6 +1360,7 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
     append_text("Resolved to ");
     append_text(resolved_ip);
     append_text("\n");
+    ESP_LOGI(TAG, "Resolved %s -> %s", host, resolved_ip);
 
     struct timeval timeout;
     timeout.tv_sec = 10;
@@ -1337,7 +1370,7 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
 
     if (::connect(ssh_socket, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
         const int err = errno;
-        ESP_LOGE(TAG, "Failed to connect socket");
+        ESP_LOGE(TAG, "Failed to connect socket errno=%d (%s)", err, strerror(err));
         append_text("ERROR: Failed to connect socket\n");
         char err_line[96];
         std::snprintf(err_line, sizeof(err_line), "errno=%d (%s)\n", err, strerror(err));
@@ -1353,10 +1386,24 @@ esp_err_t SSHTerminal::connect_with_key(const char* host, int port, const char* 
 
     ESP_LOGI(TAG, "Socket connected");
     append_text("Socket connected, initializing SSH session...\n");
+    log_heap_snapshot("pre_session_init_key");
 
     session = libssh2_session_init();
     if (!session) {
-        ESP_LOGE(TAG, "Failed to create SSH session");
+        ESP_LOGW(TAG, "Failed to create SSH session, attempting low-memory recovery");
+        append_text("WARN: session alloc failed, clearing terminal and retrying...\n");
+        if (display_lock(50)) {
+            if (terminal_output) {
+                lv_textarea_set_text(terminal_output, "");
+            }
+            display_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        log_heap_snapshot("post_recovery_key");
+        session = libssh2_session_init();
+    }
+    if (!session) {
+        ESP_LOGE(TAG, "Failed to create SSH session after recovery");
         append_text("ERROR: Failed to create SSH session\n");
         close(ssh_socket);
         ssh_socket = -1;

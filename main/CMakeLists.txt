@@ -72,6 +72,8 @@ elseif(TPAGER_TARGET)
         esp_wifi
         esp_netif
         esp_event
+        app_update
+        bootloader_support
     )
 else()
     set(REQUIRED_COMPONENTS
@@ -84,6 +86,8 @@ else()
         esp_netif
         esp_event
         esp_timer
+        app_update
+        bootloader_support
     )
 endif()
 

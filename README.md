@@ -30,4 +30,12 @@ This variant focuses on the LilyGO T-Lora Pager / T-Pager hardware and its relat
 - Power command:
   - `shutdown` / `poweroff` enters deep sleep (wake by BOOT or encoder button)
 
+## Build/Deploy Contract (T-Pager)
+- Packaged artifact name is `PocketSSH-TPager.bin`.
+- Every install cycle must also stage the same build to SD at `/sdcard/PocketSSH-TPager.bin`.
+- Recommended host flow:
+  1. `idf.py -DTPAGER_TARGET=ON -DTPAGER_DIAG=OFF build`
+  2. `./misc/package_tpager_bin.sh`
+  3. `~/.espressif/python_env/idf5.5_py3.14_env/bin/python ./misc/serial_push_bin.py --port /dev/cu.usbmodem201101`
+
 For full project features, documentation, and history, see the upstream repository above.

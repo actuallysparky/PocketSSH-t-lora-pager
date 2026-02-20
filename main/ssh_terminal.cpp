@@ -11,6 +11,9 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_crc.h"
+#include "esp_ota_ops.h"
+#include "esp_image_format.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -106,14 +109,57 @@ const lv_font_t* ui_font_terminal_big()
 #endif
 }
 
+// Scrollback contract: retain at least ~3 full terminal screens on-device even
+// during bursty output, while still bounding LVGL text area memory growth.
+constexpr size_t kTerminalScrollbackBytes = 12288;
+constexpr size_t kTerminalAppendChunkBytes = 1024;
+constexpr size_t kTerminalIngressMaxBytes = 16384;
+constexpr size_t kTerminalIngressKeepBytes = 12288;
+constexpr int64_t kTerminalFlushIntervalMs = 250;
+
 void log_heap_snapshot(const char *stage)
 {
     const uint32_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     const uint32_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     const uint32_t free32 = heap_caps_get_free_size(MALLOC_CAP_32BIT);
     const uint32_t largest32 = heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
-    ESP_LOGI(TAG, "heap[%s] free8=%" PRIu32 " largest8=%" PRIu32 " free32=%" PRIu32 " largest32=%" PRIu32,
-             stage, free8, largest8, free32, largest32);
+    const uint32_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const uint32_t largest_spiram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "heap[%s] free8=%" PRIu32 " largest8=%" PRIu32
+                  " free32=%" PRIu32 " largest32=%" PRIu32
+                  " free_psram=%" PRIu32 " largest_psram=%" PRIu32,
+             stage, free8, largest8, free32, largest32, free_spiram, largest_spiram);
+}
+
+int free_percent_for_caps(uint32_t caps)
+{
+    const uint32_t total = heap_caps_get_total_size(caps);
+    if (total == 0) {
+        return -1;
+    }
+    const uint32_t free_bytes = heap_caps_get_free_size(caps);
+    return static_cast<int>((static_cast<uint64_t>(free_bytes) * 100ULL) / total);
+}
+
+int app_flash_headroom_percent()
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running == nullptr || running->size == 0) {
+        return -1;
+    }
+
+    esp_partition_pos_t part = {};
+    part.offset = running->address;
+    part.size = running->size;
+
+    esp_image_metadata_t metadata = {};
+    if (esp_image_get_metadata(&part, &metadata) != ESP_OK || metadata.image_len == 0 ||
+        metadata.image_len > running->size) {
+        return -1;
+    }
+
+    const uint32_t free_bytes = running->size - metadata.image_len;
+    return static_cast<int>((static_cast<uint64_t>(free_bytes) * 100ULL) / running->size);
 }
 }  // namespace
 
@@ -133,38 +179,61 @@ class ScopedSDMount {
 public:
     ScopedSDMount()
     {
+        const bool was_mounted = tpager::sd_is_mounted();
         tpager::SdDiagStats stats = {};
         const esp_err_t ret = tpager::sd_mount_and_scan_keys(&stats);
+        last_err_ = ret;
         if (ret != ESP_OK) {
+            // Launcher/runtime variant: SD may already be mounted by another app
+            // at /sd or /sdcard. Accept that as usable without taking ownership.
+            struct stat st_sdcard = {};
+            struct stat st_sd = {};
+            const bool has_sdcard = (stat("/sdcard", &st_sdcard) == 0) && S_ISDIR(st_sdcard.st_mode);
+            const bool has_sd = (stat("/sd", &st_sd) == 0) && S_ISDIR(st_sd.st_mode);
+            if (has_sdcard || has_sd) {
+                ESP_LOGW(TAG, "SD mount call failed (%s), using existing mountpoint(s): /sdcard=%d /sd=%d",
+                         esp_err_to_name(ret), has_sdcard ? 1 : 0, has_sd ? 1 : 0);
+                ok_ = true;
+                mounted_ = false;
+                return;
+            }
+
             ESP_LOGW(TAG, "Failed to mount SD for runtime file access: %s", esp_err_to_name(ret));
             ok_ = false;
             return;
         }
-        mounted_ = true;
+        mounted_ = !was_mounted;
     }
 
     ~ScopedSDMount()
     {
-        if (!mounted_) {
-            return;
-        }
-        ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
+        // Runtime contract: keep SD mounted once acquired to avoid launcher/app
+        // transition races and repeated SDSPI remount timeouts.
     }
 
     bool ok() const { return ok_; }
+    esp_err_t last_err() const { return last_err_; }
 
 private:
     bool ok_ = true;
     bool mounted_ = false;
+    esp_err_t last_err_ = ESP_OK;
 };
 #endif
 
 constexpr const char *kSshConfigPath = "/sdcard/ssh_keys/ssh_config";
 constexpr const char *kSshConfigPathRoot = "/sdcard/ssh_config";
+constexpr const char *kSshConfigPathAlt = "/sd/ssh_keys/ssh_config";
+constexpr const char *kSshConfigPathAltRoot = "/sd/ssh_config";
 constexpr const char *kSshKeysRoot = "/sdcard/ssh_keys/";
+constexpr const char *kSshKeysRootAlt = "/sd/ssh_keys/";
 constexpr const char *kSshKeysDir = "/sdcard/ssh_keys";
+constexpr const char *kSshKeysDirAlt = "/sd/ssh_keys";
 constexpr const char *kWifiConfigPath = "/sdcard/ssh_keys/wifi_config";
 constexpr const char *kWifiConfigPathRoot = "/sdcard/wifi_config";
+constexpr const char *kWifiConfigPathAlt = "/sd/ssh_keys/wifi_config";
+constexpr const char *kWifiConfigPathAltRoot = "/sd/wifi_config";
+constexpr const char *kDefaultSerialRxFilename = "PocketSSH-TPager.bin";
 
 struct SSHConfigOptions {
     bool has_host_name = false;
@@ -230,6 +299,12 @@ struct WifiProfile {
     bool has_auto_connect = false;
     int file_order = 0;
 };
+
+std::string resolve_ssh_config_path();
+std::string resolve_wifi_config_path();
+bool parse_ssh_config_file(SSHConfigFile *parsed);
+bool parse_wifi_config_file(std::vector<WifiProfile> *profiles);
+bool serial_receive_to_sd_file(SSHTerminal *terminal, const std::string &target_name);
 
 std::string abbreviate_status_value(const std::string &value, size_t max_len)
 {
@@ -501,8 +576,28 @@ std::string expand_identity_file_path(std::string path)
         return std::string(kSshKeysRoot) + path.substr(7);
     }
 
+    if (path.rfind("/sd/ssh_keys/", 0) == 0) {
+        return path;
+    }
+
+    if (path.rfind("/ssh_keys/", 0) == 0) {
+        return std::string(kSshKeysRoot) + path.substr(10);
+    }
+
     if (path.rfind("/sdcard/ssh_keys/", 0) == 0) {
         return path;
+    }
+
+    if (path.rfind("/sd/", 0) == 0) {
+        return path;
+    }
+
+    if (path.rfind("sdcard/", 0) == 0) {
+        return std::string("/") + path;
+    }
+
+    if (path.rfind("ssh_keys/", 0) == 0) {
+        return std::string(kSshKeysRoot) + path.substr(9);
     }
 
     if (path[0] != '/') {
@@ -519,6 +614,54 @@ std::string base_name(const std::string &path)
         return path;
     }
     return path.substr(sep + 1);
+}
+
+bool is_probably_metadata_file(const std::string &name)
+{
+    const std::string lower = lowercase_ascii(base_name(name));
+    if (starts_with_ascii_ci(lower, "._")) {
+        return true;
+    }
+    // FAT short aliases for AppleDouble files commonly begin with '_' and
+    // include a tilde sequence (for example: _SSH_C~1).
+    return !lower.empty() && lower[0] == '_' && lower.find('~') != std::string::npos;
+}
+
+void push_unique_path(std::vector<std::string> *paths, const std::string &candidate)
+{
+    if (paths == nullptr || candidate.empty()) {
+        return;
+    }
+    for (const auto &existing : *paths) {
+        if (existing == candidate) {
+            return;
+        }
+    }
+    paths->push_back(candidate);
+}
+
+std::vector<std::string> identity_path_candidates(const std::string &raw_identity_path)
+{
+    std::vector<std::string> paths;
+    const std::string configured = trim_matching_quotes(trim_ascii(raw_identity_path));
+    const std::string expanded = expand_identity_file_path(configured);
+    const std::string leaf = base_name(expanded.empty() ? configured : expanded);
+
+    push_unique_path(&paths, configured);
+    push_unique_path(&paths, expanded);
+    if (!leaf.empty()) {
+        push_unique_path(&paths, std::string(kSshKeysRoot) + leaf);
+        push_unique_path(&paths, std::string(kSshKeysRootAlt) + leaf);
+        push_unique_path(&paths, std::string("/sdcard/") + leaf);
+        push_unique_path(&paths, std::string("/sd/") + leaf);
+    }
+
+    if (!expanded.empty() && expanded.rfind("/sdcard/", 0) == 0) {
+        push_unique_path(&paths, std::string("/sd/") + expanded.substr(8));
+    } else if (!expanded.empty() && expanded.rfind("/sd/", 0) == 0) {
+        push_unique_path(&paths, std::string("/sdcard/") + expanded.substr(4));
+    }
+    return paths;
 }
 
 bool wildcard_match(const std::string &pattern, const std::string &candidate)
@@ -727,10 +870,435 @@ bool path_exists_regular_file(const std::string &path)
     return S_ISREG(st.st_mode);
 }
 
+bool path_exists_dir(const std::string &path)
+{
+    struct stat st = {};
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISDIR(st.st_mode);
+}
+
+int count_pem_files_in_dir(const char *dir_path)
+{
+    if (dir_path == nullptr) {
+        return -1;
+    }
+    DIR *dir = opendir(dir_path);
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string name = lowercase_ascii(entry->d_name);
+        if (name.size() > 4 && name.rfind(".pem") == name.size() - 4) {
+            count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+void append_dir_listing(SSHTerminal *terminal, const char *dir_path, int max_entries)
+{
+    if (terminal == nullptr || dir_path == nullptr || max_entries <= 0) {
+        return;
+    }
+    DIR *dir = opendir(dir_path);
+    if (dir == nullptr) {
+        terminal->append_text("sdcheck: ls ");
+        terminal->append_text(dir_path);
+        terminal->append_text(" -> <unavailable>\n");
+        return;
+    }
+    terminal->append_text("sdcheck: ls ");
+    terminal->append_text(dir_path);
+    terminal->append_text(":\n");
+    int shown = 0;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr && shown < max_entries) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+        terminal->append_text("  ");
+        terminal->append_text(name.c_str());
+        terminal->append_text("\n");
+        shown++;
+    }
+    closedir(dir);
+}
+
+void append_sd_probe(SSHTerminal *terminal)
+{
+    if (terminal == nullptr) {
+        return;
+    }
+
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        terminal->append_text("sdcheck: mount call failed: ");
+        terminal->append_text(esp_err_to_name(mount_guard.last_err()));
+        terminal->append_text("; probing existing paths\n");
+    }
+#endif
+
+    const bool has_sdcard = path_exists_dir("/sdcard");
+    const bool has_sd = path_exists_dir("/sd");
+    const bool has_sdcard_keys = path_exists_dir(kSshKeysDir);
+    const bool has_sd_keys = path_exists_dir(kSshKeysDirAlt);
+
+    char line[192];
+    std::snprintf(line, sizeof(line), "sdcheck: dir /sdcard=%d /sd=%d /sdcard/ssh_keys=%d /sd/ssh_keys=%d\n",
+                  has_sdcard ? 1 : 0, has_sd ? 1 : 0, has_sdcard_keys ? 1 : 0, has_sd_keys ? 1 : 0);
+    terminal->append_text(line);
+
+    const int pem_sdcard = count_pem_files_in_dir(kSshKeysDir);
+    const int pem_sd = count_pem_files_in_dir(kSshKeysDirAlt);
+    std::snprintf(line, sizeof(line), "sdcheck: pem count /sdcard/ssh_keys=%d /sd/ssh_keys=%d\n", pem_sdcard, pem_sd);
+    terminal->append_text(line);
+
+    std::snprintf(line, sizeof(line), "sdcheck: ssh_config /sdcard=%d /sd=%d\n",
+                  path_exists_regular_file(kSshConfigPath) ? 1 : 0,
+                  path_exists_regular_file(kSshConfigPathAlt) ? 1 : 0);
+    terminal->append_text(line);
+
+    std::snprintf(line, sizeof(line), "sdcheck: wifi_config /sdcard=%d /sd=%d\n",
+                  path_exists_regular_file(kWifiConfigPath) ? 1 : 0,
+                  path_exists_regular_file(kWifiConfigPathAlt) ? 1 : 0);
+    terminal->append_text(line);
+
+    const std::string ssh_path = resolve_ssh_config_path();
+    const std::string wifi_path = resolve_wifi_config_path();
+    terminal->append_text("sdcheck: resolved ssh_config -> ");
+    terminal->append_text(ssh_path.c_str());
+    terminal->append_text("\n");
+    terminal->append_text("sdcheck: resolved wifi_config -> ");
+    terminal->append_text(wifi_path.c_str());
+    terminal->append_text("\n");
+
+    SSHConfigFile parsed_ssh = {};
+    const bool ssh_ok = parse_ssh_config_file(&parsed_ssh);
+    std::snprintf(line, sizeof(line), "sdcheck: parse ssh_config=%d aliases=%d host_blocks=%d\n",
+                  ssh_ok ? 1 : 0,
+                  static_cast<int>(parsed_ssh.aliases.size()),
+                  static_cast<int>(parsed_ssh.host_blocks.size()));
+    terminal->append_text(line);
+
+    std::vector<WifiProfile> profiles;
+    const bool wifi_ok = parse_wifi_config_file(&profiles);
+    std::snprintf(line, sizeof(line), "sdcheck: parse wifi_config=%d profiles=%d\n",
+                  wifi_ok ? 1 : 0,
+                  static_cast<int>(profiles.size()));
+    terminal->append_text(line);
+
+    append_dir_listing(terminal, kSshKeysDir, 12);
+    append_dir_listing(terminal, kSshKeysDirAlt, 12);
+}
+
+bool parse_u64_decimal(const std::string &text, uint64_t *out)
+{
+    if (out == nullptr || text.empty()) {
+        return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0') {
+        return false;
+    }
+    *out = static_cast<uint64_t>(value);
+    return true;
+}
+
+bool parse_u32_hex(const std::string &text, uint32_t *out)
+{
+    if (out == nullptr || text.empty()) {
+        return false;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text.c_str(), &end, 16);
+    if (errno != 0 || end == text.c_str() || *end != '\0' || value > 0xFFFFFFFFUL) {
+        return false;
+    }
+    *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool serial_read_line_with_timeout(int timeout_ms, std::string *line_out)
+{
+    if (line_out == nullptr) {
+        return false;
+    }
+    line_out->clear();
+
+    const int stdin_fd = fileno(stdin);
+    if (stdin_fd < 0) {
+        return false;
+    }
+
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(stdin_fd, &readfds);
+
+        struct timeval tv = {};
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        const int sel = select(stdin_fd + 1, &readfds, nullptr, nullptr, &tv);
+        if (sel <= 0) {
+            return false;
+        }
+
+        char ch = '\0';
+        const ssize_t n = read(stdin_fd, &ch, 1);
+        if (n <= 0) {
+            return false;
+        }
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            return true;
+        }
+        if (line_out->size() < 2048) {
+            line_out->push_back(ch);
+        }
+    }
+}
+
+int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+bool decode_hex_payload(const std::string &hex, std::vector<uint8_t> *bytes_out)
+{
+    if (bytes_out == nullptr || (hex.size() % 2) != 0) {
+        return false;
+    }
+    bytes_out->clear();
+    bytes_out->reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        const int hi = hex_nibble(hex[i]);
+        const int lo = hex_nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        bytes_out->push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return true;
+}
+
+bool valid_serial_target_name(const std::string &name)
+{
+    if (name.empty() || name.size() > 64) {
+        return false;
+    }
+    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos ||
+        name.find("..") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+bool serial_receive_to_sd_file(SSHTerminal *terminal, const std::string &target_name)
+{
+    if (terminal == nullptr) {
+        return false;
+    }
+    struct SerialRxFlagGuard {
+        SSHTerminal *terminal = nullptr;
+        explicit SerialRxFlagGuard(SSHTerminal *t) : terminal(t)
+        {
+            if (terminal != nullptr) {
+                terminal->set_serial_rx_in_progress(true);
+            }
+        }
+        ~SerialRxFlagGuard()
+        {
+            if (terminal != nullptr) {
+                terminal->set_serial_rx_in_progress(false);
+            }
+        }
+    } serial_rx_guard(terminal);
+
+    if (!valid_serial_target_name(target_name)) {
+        terminal->append_text("serialrx: invalid target filename\n");
+        return false;
+    }
+
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        terminal->append_text("serialrx: SD mount failed\n");
+        return false;
+    }
+#endif
+
+    const char *root_dir = path_exists_dir("/sdcard") ? "/sdcard" : (path_exists_dir("/sd") ? "/sd" : nullptr);
+    if (root_dir == nullptr) {
+        terminal->append_text("serialrx: no SD root mountpoint\n");
+        return false;
+    }
+
+    const std::string target_path = std::string(root_dir) + "/" + target_name;
+    FILE *out = std::fopen(target_path.c_str(), "wb");
+    if (out == nullptr) {
+        terminal->append_text("serialrx: failed to open target file\n");
+        return false;
+    }
+
+    terminal->append_text("serialrx: waiting for BEGIN <size> <crc32hex>\n");
+    terminal->append_text("serialrx: send DATA <hex> lines, then END\n");
+    ESP_LOGI(TAG, "serialrx ready: target=%s", target_path.c_str());
+    ESP_LOGI(TAG, "POCKETCTL serialrx_ready target=%s", target_path.c_str());
+
+    std::string line;
+    if (!serial_read_line_with_timeout(30000, &line)) {
+        terminal->append_text("serialrx: timeout waiting for BEGIN\n");
+        std::fclose(out);
+        return false;
+    }
+
+    const std::vector<std::string> begin_parts = split_nonempty_whitespace(line);
+    if (begin_parts.size() < 3 || lowercase_ascii(begin_parts[0]) != "begin") {
+        terminal->append_text("serialrx: invalid BEGIN header\n");
+        std::fclose(out);
+        return false;
+    }
+
+    uint64_t expected_size_u64 = 0;
+    uint32_t expected_crc = 0;
+    if (!parse_u64_decimal(begin_parts[1], &expected_size_u64) ||
+        !parse_u32_hex(begin_parts[2], &expected_crc)) {
+        terminal->append_text("serialrx: invalid BEGIN arguments\n");
+        std::fclose(out);
+        return false;
+    }
+    const size_t expected_size = static_cast<size_t>(expected_size_u64);
+
+    char hdr[128];
+    std::snprintf(hdr, sizeof(hdr), "serialrx: receiving %u bytes to %s\n",
+                  static_cast<unsigned>(expected_size),
+                  target_path.c_str());
+    terminal->append_text(hdr);
+
+    std::vector<uint8_t> chunk;
+    size_t received = 0;
+    uint32_t crc = 0;
+    int last_percent = -1;
+
+    while (received < expected_size) {
+        if (!serial_read_line_with_timeout(20000, &line)) {
+            terminal->append_text("serialrx: timeout during transfer\n");
+            std::fclose(out);
+            std::remove(target_path.c_str());
+            return false;
+        }
+
+        const std::vector<std::string> parts = split_nonempty_whitespace(line);
+        if (parts.empty()) {
+            continue;
+        }
+        const std::string cmd = lowercase_ascii(parts[0]);
+        if (cmd == "abort") {
+            terminal->append_text("serialrx: aborted by host\n");
+            std::fclose(out);
+            std::remove(target_path.c_str());
+            return false;
+        }
+        if (cmd != "data" || parts.size() < 2) {
+            continue;
+        }
+
+        if (!decode_hex_payload(parts[1], &chunk)) {
+            terminal->append_text("serialrx: invalid DATA hex payload\n");
+            std::fclose(out);
+            std::remove(target_path.c_str());
+            return false;
+        }
+        if (chunk.empty()) {
+            continue;
+        }
+        if (received + chunk.size() > expected_size) {
+            terminal->append_text("serialrx: DATA exceeds expected size\n");
+            std::fclose(out);
+            std::remove(target_path.c_str());
+            return false;
+        }
+        const size_t written = std::fwrite(chunk.data(), 1, chunk.size(), out);
+        if (written != chunk.size()) {
+            terminal->append_text("serialrx: write failure\n");
+            std::fclose(out);
+            std::remove(target_path.c_str());
+            return false;
+        }
+        crc = esp_crc32_le(crc, chunk.data(), static_cast<uint32_t>(chunk.size()));
+        received += chunk.size();
+
+        const int pct = (expected_size == 0) ? 100 : static_cast<int>((received * 100U) / expected_size);
+        if (pct >= last_percent + 10 || pct == 100) {
+            last_percent = pct;
+            char linebuf[64];
+            std::snprintf(linebuf, sizeof(linebuf), "serialrx: %d%% (%u/%u)\n",
+                          pct,
+                          static_cast<unsigned>(received),
+                          static_cast<unsigned>(expected_size));
+            terminal->append_text(linebuf);
+        }
+    }
+
+    if (!serial_read_line_with_timeout(5000, &line)) {
+        terminal->append_text("serialrx: missing END marker\n");
+        std::fclose(out);
+        std::remove(target_path.c_str());
+        return false;
+    }
+
+    const std::vector<std::string> end_parts = split_nonempty_whitespace(line);
+    if (end_parts.empty() || lowercase_ascii(end_parts[0]) != "end") {
+        terminal->append_text("serialrx: invalid END marker\n");
+        std::fclose(out);
+        std::remove(target_path.c_str());
+        return false;
+    }
+
+    std::fflush(out);
+    std::fclose(out);
+
+    if (crc != expected_crc) {
+        terminal->append_text("serialrx: CRC mismatch, file removed\n");
+        ESP_LOGE(TAG, "serialrx CRC mismatch expected=%08" PRIx32 " actual=%08" PRIx32, expected_crc, crc);
+        std::remove(target_path.c_str());
+        return false;
+    }
+
+    terminal->append_text("serialrx: transfer complete\n");
+    ESP_LOGI(TAG, "serialrx complete: path=%s bytes=%u crc=%08" PRIx32,
+             target_path.c_str(), static_cast<unsigned>(received), crc);
+    return true;
+}
+
 std::string resolve_ssh_config_path()
 {
     const std::string preferred = kSshConfigPath;
     const std::string root_preferred = kSshConfigPathRoot;
+    const std::string alt_preferred = kSshConfigPathAlt;
+    const std::string alt_root_preferred = kSshConfigPathAltRoot;
 
     auto candidate_score = [](const std::string &lower_name) -> int {
         if (lower_name == "ssh_config") {
@@ -805,6 +1373,9 @@ std::string resolve_ssh_config_path()
                 continue;
             }
             const std::string lower = lowercase_ascii(name);
+            if (starts_with_ascii_ci(lower, "._")) {
+                continue;
+            }
             const int score = candidate_score(lower);
             if (score <= 0) {
                 continue;
@@ -830,28 +1401,36 @@ std::string resolve_ssh_config_path()
 
     std::vector<SSHConfigCandidate> candidates;
     scan_dir(kSshKeysDir, 1, &candidates);
+    scan_dir(kSshKeysDirAlt, 1, &candidates);
     scan_dir("/sdcard", 0, &candidates);
+    scan_dir("/sd", 0, &candidates);
 
     if (candidates.empty()) {
-        ESP_LOGW(TAG, "ssh_config resolve: no candidate in %s or /sdcard; expected %s or %s",
-                 kSshKeysDir, preferred.c_str(), root_preferred.c_str());
+        ESP_LOGW(TAG,
+                 "ssh_config resolve: no candidate in %s, %s, /sdcard, or /sd; expected %s, %s, %s, or %s",
+                 kSshKeysDir,
+                 kSshKeysDirAlt,
+                 preferred.c_str(),
+                 root_preferred.c_str(),
+                 alt_preferred.c_str(),
+                 alt_root_preferred.c_str());
         return preferred;
     }
 
     const SSHConfigCandidate *best = &candidates[0];
     for (const auto &candidate : candidates) {
         bool take = false;
-        if (candidate.mtime > best->mtime) {
+        if (candidate.score > best->score) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score > best->score) {
+        } else if (candidate.score == best->score && candidate.mtime > best->mtime) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde > best->tilde) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde == best->tilde && candidate.dir_rank > best->dir_rank) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde == best->tilde && candidate.dir_rank == best->dir_rank &&
                    candidate.lower_name > best->lower_name) {
             take = true;
@@ -870,6 +1449,8 @@ std::string resolve_wifi_config_path()
 {
     const std::string preferred = kWifiConfigPath;
     const std::string root_preferred = kWifiConfigPathRoot;
+    const std::string alt_preferred = kWifiConfigPathAlt;
+    const std::string alt_root_preferred = kWifiConfigPathAltRoot;
 
     auto candidate_score = [](const std::string &lower_name) -> int {
         if (lower_name == "wifi_config") {
@@ -941,6 +1522,9 @@ std::string resolve_wifi_config_path()
                 continue;
             }
             const std::string lower = lowercase_ascii(name);
+            if (starts_with_ascii_ci(lower, "._")) {
+                continue;
+            }
             const int score = candidate_score(lower);
             if (score <= 0) {
                 continue;
@@ -966,28 +1550,36 @@ std::string resolve_wifi_config_path()
 
     std::vector<WifiConfigCandidate> candidates;
     scan_dir(kSshKeysDir, 1, &candidates);
+    scan_dir(kSshKeysDirAlt, 1, &candidates);
     scan_dir("/sdcard", 0, &candidates);
+    scan_dir("/sd", 0, &candidates);
 
     if (candidates.empty()) {
-        ESP_LOGW(TAG, "wifi_config resolve: no candidate in %s or /sdcard; expected %s or %s",
-                 kSshKeysDir, preferred.c_str(), root_preferred.c_str());
+        ESP_LOGW(TAG,
+                 "wifi_config resolve: no candidate in %s, %s, /sdcard, or /sd; expected %s, %s, %s, or %s",
+                 kSshKeysDir,
+                 kSshKeysDirAlt,
+                 preferred.c_str(),
+                 root_preferred.c_str(),
+                 alt_preferred.c_str(),
+                 alt_root_preferred.c_str());
         return preferred;
     }
 
     const WifiConfigCandidate *best = &candidates[0];
     for (const auto &candidate : candidates) {
         bool take = false;
-        if (candidate.mtime > best->mtime) {
+        if (candidate.score > best->score) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score > best->score) {
+        } else if (candidate.score == best->score && candidate.mtime > best->mtime) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde > best->tilde) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde == best->tilde && candidate.dir_rank > best->dir_rank) {
             take = true;
-        } else if (candidate.mtime == best->mtime && candidate.score == best->score &&
+        } else if (candidate.score == best->score && candidate.mtime == best->mtime &&
                    candidate.tilde == best->tilde && candidate.dir_rank == best->dir_rank &&
                    candidate.lower_name > best->lower_name) {
             take = true;
@@ -1025,76 +1617,156 @@ bool parse_wifi_config_file(std::vector<WifiProfile> *profiles)
 #if defined(TPAGER_TARGET)
     ScopedSDMount mount_guard = {};
     if (!mount_guard.ok()) {
-        return false;
+        ESP_LOGW(TAG, "parse_wifi_config_file: mount helper failed, continuing with direct path probes");
     }
 #endif
 
-    const std::string config_path = resolve_wifi_config_path();
-    FILE *file = std::fopen(config_path.c_str(), "r");
-    if (file == nullptr) {
-        ESP_LOGW(TAG, "wifi_config open failed: %s (errno=%d %s)",
-                 config_path.c_str(), errno, strerror(errno));
+    auto parse_wifi_path = [&](const std::string &config_path, std::vector<WifiProfile> *out_profiles) -> bool {
+        if (out_profiles == nullptr) {
+            return false;
+        }
+        out_profiles->clear();
+
+        FILE *file = std::fopen(config_path.c_str(), "r");
+        if (file == nullptr) {
+            return false;
+        }
+
+        WifiProfile current = {};
+        bool in_profile = false;
+        int order = 0;
+        char line_buffer[512];
+        while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
+            std::string line = line_buffer;
+            line = trim_ascii(strip_inline_comment(line));
+            if (line.empty()) {
+                continue;
+            }
+
+            std::string key;
+            std::string value;
+            if (!split_directive(line, &key, &value)) {
+                continue;
+            }
+
+            const std::string directive = lowercase_ascii(key);
+            const std::string cleaned_value = trim_matching_quotes(trim_ascii(value));
+            if (directive == "network") {
+                if (in_profile) {
+                    maybe_push_wifi_profile(current, out_profiles);
+                }
+                current = {};
+                current.network_name = cleaned_value;
+                current.file_order = order++;
+                in_profile = true;
+                continue;
+            }
+
+            if (!in_profile) {
+                // Tolerate top-level keys by implicitly creating a profile.
+                current = {};
+                current.file_order = order++;
+                in_profile = true;
+            }
+
+            if (directive == "ssid") {
+                current.ssid = cleaned_value;
+            } else if (directive == "password") {
+                current.password = cleaned_value;
+            } else if (directive == "autoconnect") {
+                bool parsed = false;
+                if (parse_bool_flag(cleaned_value, &parsed)) {
+                    current.auto_connect = parsed;
+                    current.has_auto_connect = true;
+                }
+            } else if (directive == "priority") {
+                // Accepted for compatibility with requirement doc; currently unused.
+            }
+        }
+
+        if (in_profile) {
+            maybe_push_wifi_profile(current, out_profiles);
+        }
+
+        std::fclose(file);
+        return true;
+    };
+
+    std::vector<std::string> candidates;
+    auto add_candidate = [&](const std::string &path) {
+        if (path.empty()) {
+            return;
+        }
+        for (const auto &existing : candidates) {
+            if (existing == path) {
+                return;
+            }
+        }
+        candidates.push_back(path);
+    };
+
+    add_candidate(kWifiConfigPath);
+    add_candidate(kWifiConfigPathRoot);
+    add_candidate(kWifiConfigPathAlt);
+    add_candidate(kWifiConfigPathAltRoot);
+    add_candidate(resolve_wifi_config_path());
+
+    auto scan_candidates = [&](const char *dir_path) {
+        if (dir_path == nullptr) {
+            return;
+        }
+        DIR *dir = opendir(dir_path);
+        if (dir == nullptr) {
+            return;
+        }
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            const std::string lower = lowercase_ascii(name);
+            if (starts_with_ascii_ci(lower, "._")) {
+                continue;
+            }
+            if (lower.find("wifi") == std::string::npos) {
+                continue;
+            }
+            const std::string path = std::string(dir_path) + "/" + name;
+            struct stat st = {};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+            add_candidate(path);
+        }
+        closedir(dir);
+    };
+
+    scan_candidates(kSshKeysDir);
+    scan_candidates(kSshKeysDirAlt);
+    scan_candidates("/sdcard");
+    scan_candidates("/sd");
+
+    bool opened_any = false;
+    for (const auto &path : candidates) {
+        std::vector<WifiProfile> parsed_profiles;
+        if (!parse_wifi_path(path, &parsed_profiles)) {
+            continue;
+        }
+        opened_any = true;
+        ESP_LOGI(TAG, "wifi_config open: %s (profiles=%d)", path.c_str(), static_cast<int>(parsed_profiles.size()));
+        if (!parsed_profiles.empty()) {
+            *profiles = std::move(parsed_profiles);
+            return true;
+        }
+    }
+
+    if (!opened_any) {
+        ESP_LOGW(TAG, "wifi_config open failed for all candidates");
         return false;
     }
-    ESP_LOGI(TAG, "wifi_config open: %s", config_path.c_str());
 
-    WifiProfile current = {};
-    bool in_profile = false;
-    int order = 0;
-    char line_buffer[512];
-    while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
-        std::string line = line_buffer;
-        line = trim_ascii(strip_inline_comment(line));
-        if (line.empty()) {
-            continue;
-        }
-
-        std::string key;
-        std::string value;
-        if (!split_directive(line, &key, &value)) {
-            continue;
-        }
-
-        const std::string directive = lowercase_ascii(key);
-        const std::string cleaned_value = trim_matching_quotes(trim_ascii(value));
-        if (directive == "network") {
-            if (in_profile) {
-                maybe_push_wifi_profile(current, profiles);
-            }
-            current = {};
-            current.network_name = cleaned_value;
-            current.file_order = order++;
-            in_profile = true;
-            continue;
-        }
-
-        if (!in_profile) {
-            // Tolerate top-level keys by implicitly creating a profile.
-            current = {};
-            current.file_order = order++;
-            in_profile = true;
-        }
-
-        if (directive == "ssid") {
-            current.ssid = cleaned_value;
-        } else if (directive == "password") {
-            current.password = cleaned_value;
-        } else if (directive == "autoconnect") {
-            bool parsed = false;
-            if (parse_bool_flag(cleaned_value, &parsed)) {
-                current.auto_connect = parsed;
-                current.has_auto_connect = true;
-            }
-        } else if (directive == "priority") {
-            // Accepted for compatibility with requirement doc; currently unused.
-        }
-    }
-
-    if (in_profile) {
-        maybe_push_wifi_profile(current, profiles);
-    }
-
-    std::fclose(file);
+    ESP_LOGW(TAG, "wifi_config parsed but no profiles found");
     return true;
 }
 
@@ -1129,69 +1801,162 @@ bool parse_ssh_config_file(SSHConfigFile *parsed)
 #if defined(TPAGER_TARGET)
     ScopedSDMount mount_guard = {};
     if (!mount_guard.ok()) {
-        return false;
+        ESP_LOGW(TAG, "parse_ssh_config_file: mount helper failed, continuing with direct path probes");
     }
 #endif
 
-    const std::string config_path = resolve_ssh_config_path();
-    FILE *file = std::fopen(config_path.c_str(), "r");
-    if (file == nullptr) {
-        ESP_LOGW(TAG, "ssh_config open failed: %s (errno=%d %s)",
-                 config_path.c_str(), errno, strerror(errno));
-        return false;
-    }
-    ESP_LOGI(TAG, "ssh_config open: %s", config_path.c_str());
+    auto parse_ssh_path = [&](const std::string &config_path, SSHConfigFile *out_parsed) -> bool {
+        if (out_parsed == nullptr) {
+            return false;
+        }
+        *out_parsed = {};
 
-    std::set<std::string> alias_seen;
-    SSHConfigHostBlock *active_host = nullptr;
-    bool saw_host = false;
-    char line_buffer[512];
-    while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
-        std::string line = line_buffer;
-        line = trim_ascii(strip_inline_comment(line));
-        if (line.empty()) {
-            continue;
+        FILE *file = std::fopen(config_path.c_str(), "r");
+        if (file == nullptr) {
+            return false;
         }
 
-        std::string key;
-        std::string value;
-        if (!split_directive(line, &key, &value)) {
-            continue;
-        }
-
-        const std::string directive = lowercase_ascii(key);
-        if (directive == "host") {
-            const std::vector<std::string> patterns = split_nonempty_whitespace(value);
-            if (patterns.empty()) {
+        std::set<std::string> alias_seen;
+        SSHConfigHostBlock *active_host = nullptr;
+        bool saw_host = false;
+        char line_buffer[512];
+        while (std::fgets(line_buffer, sizeof(line_buffer), file) != nullptr) {
+            std::string line = line_buffer;
+            line = trim_ascii(strip_inline_comment(line));
+            if (line.empty()) {
                 continue;
             }
 
-            saw_host = true;
-            parsed->host_blocks.push_back({});
-            active_host = &parsed->host_blocks.back();
-            active_host->patterns = patterns;
-
-            for (const std::string &pattern : patterns) {
-                if (pattern.empty() || pattern[0] == '!') {
-                    continue;
-                }
-                if (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos) {
-                    continue;
-                }
-                if (alias_seen.insert(pattern).second) {
-                    parsed->aliases.push_back(pattern);
-                }
+            std::string key;
+            std::string value;
+            if (!split_directive(line, &key, &value)) {
+                continue;
             }
-            continue;
+
+            const std::string directive = lowercase_ascii(key);
+            if (directive == "host") {
+                const std::vector<std::string> patterns = split_nonempty_whitespace(value);
+                if (patterns.empty()) {
+                    continue;
+                }
+
+                saw_host = true;
+                out_parsed->host_blocks.push_back({});
+                active_host = &out_parsed->host_blocks.back();
+                active_host->patterns = patterns;
+
+                for (const std::string &pattern : patterns) {
+                    if (pattern.empty() || pattern[0] == '!') {
+                        continue;
+                    }
+                    if (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos) {
+                        continue;
+                    }
+                    if (alias_seen.insert(pattern).second) {
+                        out_parsed->aliases.push_back(pattern);
+                    }
+                }
+                continue;
+            }
+
+            SSHConfigOptions *target = (!saw_host || active_host == nullptr)
+                                           ? &out_parsed->global_options
+                                           : &active_host->options;
+            apply_option(directive, value, target);
         }
 
-        SSHConfigOptions *target = (!saw_host || active_host == nullptr)
-                                       ? &parsed->global_options
-                                       : &active_host->options;
-        apply_option(directive, value, target);
+        std::fclose(file);
+        return true;
+    };
+
+    std::vector<std::string> candidates;
+    auto add_candidate = [&](const std::string &path) {
+        if (path.empty()) {
+            return;
+        }
+        for (const auto &existing : candidates) {
+            if (existing == path) {
+                return;
+            }
+        }
+        candidates.push_back(path);
+    };
+
+    add_candidate(kSshConfigPath);
+    add_candidate(kSshConfigPathRoot);
+    add_candidate(kSshConfigPathAlt);
+    add_candidate(kSshConfigPathAltRoot);
+    add_candidate(resolve_ssh_config_path());
+
+    auto scan_candidates = [&](const char *dir_path) {
+        if (dir_path == nullptr) {
+            return;
+        }
+        DIR *dir = opendir(dir_path);
+        if (dir == nullptr) {
+            return;
+        }
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            const std::string lower = lowercase_ascii(name);
+            if (starts_with_ascii_ci(lower, "._")) {
+                continue;
+            }
+            if (lower.find("ssh") == std::string::npos || lower.find("config") == std::string::npos) {
+                continue;
+            }
+            const std::string path = std::string(dir_path) + "/" + name;
+            struct stat st = {};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+            add_candidate(path);
+        }
+        closedir(dir);
+    };
+
+    scan_candidates(kSshKeysDir);
+    scan_candidates(kSshKeysDirAlt);
+    scan_candidates("/sdcard");
+    scan_candidates("/sd");
+
+    bool opened_any = false;
+    SSHConfigFile first_parsed = {};
+    bool have_first_parsed = false;
+    for (const auto &path : candidates) {
+        SSHConfigFile parsed_candidate = {};
+        if (!parse_ssh_path(path, &parsed_candidate)) {
+            continue;
+        }
+        opened_any = true;
+        ESP_LOGI(TAG, "ssh_config open: %s (aliases=%d host_blocks=%d)",
+                 path.c_str(),
+                 static_cast<int>(parsed_candidate.aliases.size()),
+                 static_cast<int>(parsed_candidate.host_blocks.size()));
+
+        if (!have_first_parsed) {
+            first_parsed = parsed_candidate;
+            have_first_parsed = true;
+        }
+        if (!parsed_candidate.host_blocks.empty() || !parsed_candidate.aliases.empty()) {
+            *parsed = std::move(parsed_candidate);
+            return true;
+        }
     }
 
-    std::fclose(file);
+    if (!opened_any) {
+        ESP_LOGW(TAG, "ssh_config open failed for all candidates");
+        return false;
+    }
+
+    if (have_first_parsed) {
+        *parsed = std::move(first_parsed);
+    }
+    ESP_LOGW(TAG, "ssh_config parsed but no Host blocks found");
     return true;
 }
 
@@ -1262,7 +2027,7 @@ bool read_file_contents(const std::string &path, std::string *contents)
 #if defined(TPAGER_TARGET)
     ScopedSDMount mount_guard = {};
     if (!mount_guard.ok()) {
-        return false;
+        ESP_LOGW(TAG, "read_file_contents: mount helper failed, trying direct open for %s", path.c_str());
     }
 #endif
 
@@ -1297,6 +2062,134 @@ bool read_file_contents(const std::string &path, std::string *contents)
     return true;
 }
 
+bool has_pem_extension(const std::string &name)
+{
+    if (is_probably_metadata_file(name)) {
+        return false;
+    }
+    const std::string lowered = lowercase_ascii(name);
+    if (lowered.size() >= 4 && lowered.rfind(".pem") == lowered.size() - 4) {
+        return true;
+    }
+    // Some FAT aliases may not contain the dot separator.
+    return lowered.size() >= 3 && lowered.rfind("pem") == lowered.size() - 3;
+}
+
+std::string short_name_prefix(const std::string &name)
+{
+    std::string stem = lowercase_ascii(base_name(name));
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos) {
+        stem = stem.substr(0, dot);
+    }
+    const size_t tilde = stem.find('~');
+    if (tilde == std::string::npos || tilde == 0) {
+        return "";
+    }
+    std::string prefix = stem.substr(0, tilde);
+    std::string normalized;
+    normalized.reserve(prefix.size());
+    for (char c : prefix) {
+        if (std::isalnum(static_cast<unsigned char>(c)) != 0) {
+            normalized.push_back(c);
+        }
+    }
+    return normalized;
+}
+
+int load_keys_from_sd_if_needed(SSHTerminal *terminal)
+{
+    if (terminal == nullptr) {
+        return 0;
+    }
+    if (!terminal->get_loaded_key_names().empty()) {
+        return 0;
+    }
+
+#if defined(TPAGER_TARGET)
+    ScopedSDMount mount_guard = {};
+    if (!mount_guard.ok()) {
+        ESP_LOGW(TAG, "On-demand key load: mount helper failed, trying direct directory access");
+    }
+#endif
+
+    const char *active_keys_dir = kSshKeysDir;
+    DIR *dir = opendir(kSshKeysDir);
+    if (dir == nullptr) {
+        active_keys_dir = kSshKeysDirAlt;
+        dir = opendir(kSshKeysDirAlt);
+    }
+    if (dir == nullptr) {
+        ESP_LOGW(TAG, "On-demand key load skipped: unable to open %s or %s", kSshKeysDir, kSshKeysDirAlt);
+        return 0;
+    }
+
+    int loaded = 0;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string filename = entry->d_name;
+        if (filename == "." || filename == ".." || is_probably_metadata_file(filename) || !has_pem_extension(filename)) {
+            continue;
+        }
+
+        const std::string full_path = std::string(active_keys_dir) + "/" + filename;
+        FILE *file = std::fopen(full_path.c_str(), "rb");
+        if (file == nullptr) {
+            continue;
+        }
+        if (std::fseek(file, 0, SEEK_END) != 0) {
+            std::fclose(file);
+            continue;
+        }
+        const long file_size = std::ftell(file);
+        if (file_size <= 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+            std::fclose(file);
+            continue;
+        }
+
+        std::string key_data(static_cast<size_t>(file_size), '\0');
+        const size_t read_count = std::fread(key_data.data(), 1, static_cast<size_t>(file_size), file);
+        std::fclose(file);
+        if (read_count != static_cast<size_t>(file_size)) {
+            continue;
+        }
+
+        terminal->load_key_from_memory(filename.c_str(), key_data.c_str(), key_data.size());
+        loaded++;
+    }
+    closedir(dir);
+    return loaded;
+}
+
+bool parse_short_83_name(const std::string &name, std::string *prefix, std::string *ext)
+{
+    if (prefix == nullptr || ext == nullptr) {
+        return false;
+    }
+
+    const std::string lower = lowercase_ascii(base_name(name));
+    const size_t dot = lower.rfind('.');
+    const std::string stem = (dot == std::string::npos) ? lower : lower.substr(0, dot);
+    if (stem.empty()) {
+        return false;
+    }
+    const size_t tilde = stem.find('~');
+    if (tilde == std::string::npos || tilde == 0 || tilde + 1 >= stem.size()) {
+        return false;
+    }
+
+    for (size_t i = tilde + 1; i < stem.size(); ++i) {
+        const char c = stem[i];
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+
+    *prefix = stem.substr(0, tilde);
+    *ext = (dot == std::string::npos) ? std::string() : lower.substr(dot);
+    return !prefix->empty();
+}
+
 std::string normalize_key_stem(const std::string &filename)
 {
     std::string stem = lowercase_ascii(base_name(filename));
@@ -1313,6 +2206,109 @@ std::string normalize_key_stem(const std::string &filename)
         }
     }
     return normalized;
+}
+
+int score_identity_candidate(const std::string &desired_name, const std::string &candidate_name)
+{
+    if (desired_name.empty() || candidate_name.empty()) {
+        return 0;
+    }
+    if (is_probably_metadata_file(candidate_name) || !has_pem_extension(candidate_name)) {
+        return 0;
+    }
+
+    const std::string desired_lower = lowercase_ascii(base_name(desired_name));
+    const std::string candidate_lower = lowercase_ascii(base_name(candidate_name));
+    if (candidate_lower == desired_lower) {
+        return 300;
+    }
+
+    const std::string target_stem = normalize_key_stem(desired_lower);
+    const std::string candidate_stem = normalize_key_stem(candidate_lower);
+    if (target_stem.empty() || candidate_stem.empty()) {
+        return 0;
+    }
+    if (candidate_stem == target_stem) {
+        return 250;
+    }
+
+    if (target_stem.rfind(candidate_stem, 0) == 0 || candidate_stem.rfind(target_stem, 0) == 0) {
+        return 220;
+    }
+
+    const std::string candidate_short_prefix = short_name_prefix(candidate_lower);
+    if (!candidate_short_prefix.empty() && target_stem.rfind(candidate_short_prefix, 0) == 0) {
+        return 200;
+    }
+
+    return 0;
+}
+
+std::string resolve_identity_file_on_sd(const std::string &identity_path)
+{
+    const std::string desired_name = base_name(identity_path);
+    if (desired_name.empty()) {
+        return "";
+    }
+
+    struct Candidate {
+        std::string path;
+        int score = 0;
+    };
+
+    Candidate best = {};
+    int pem_file_count = 0;
+    std::string single_pem_path;
+
+    const char *dirs[] = {kSshKeysDir, kSshKeysDirAlt, "/sdcard", "/sd"};
+    for (const char *dir_path : dirs) {
+        DIR *dir = opendir(dir_path);
+        if (dir == nullptr) {
+            continue;
+        }
+
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const std::string entry_name = entry->d_name;
+            if (entry_name == "." || entry_name == "..") {
+                continue;
+            }
+            if (!has_pem_extension(entry_name)) {
+                continue;
+            }
+
+            const std::string candidate_path = std::string(dir_path) + "/" + entry_name;
+            struct stat st = {};
+            if (stat(candidate_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+
+            pem_file_count++;
+            single_pem_path = candidate_path;
+
+            const int score = score_identity_candidate(desired_name, entry_name);
+            if (score > best.score || (score == best.score && !best.path.empty() && candidate_path < best.path) ||
+                (score == best.score && best.path.empty())) {
+                best.path = candidate_path;
+                best.score = score;
+            }
+        }
+        closedir(dir);
+    }
+
+    if (best.score > 0) {
+        ESP_LOGI(TAG, "identity resolve: %s -> %s (score=%d)",
+                 desired_name.c_str(),
+                 best.path.c_str(),
+                 best.score);
+        return best.path;
+    }
+    if (pem_file_count == 1) {
+        ESP_LOGI(TAG, "identity resolve: only one key present, using %s", single_pem_path.c_str());
+        return single_pem_path;
+    }
+    ESP_LOGW(TAG, "identity resolve: no SD match for %s (pem candidates=%d)", desired_name.c_str(), pem_file_count);
+    return "";
 }
 
 const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
@@ -1349,9 +2345,14 @@ const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
         if (candidate_stem.empty() || target_stem.empty()) {
             continue;
         }
-        if (candidate_stem == target_stem ||
-            target_stem.rfind(candidate_stem, 0) == 0 ||
-            candidate_stem.rfind(target_stem, 0) == 0) {
+        bool this_match = (candidate_stem == target_stem ||
+                           target_stem.rfind(candidate_stem, 0) == 0 ||
+                           candidate_stem.rfind(target_stem, 0) == 0);
+        const std::string cand_short_prefix = short_name_prefix(candidate);
+        if (!this_match && !cand_short_prefix.empty() && target_stem.rfind(cand_short_prefix, 0) == 0) {
+            this_match = true;
+        }
+        if (this_match) {
             matched_name = candidate;
             match_count++;
         }
@@ -1364,6 +2365,36 @@ const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
         return terminal->get_loaded_key(matched_name.c_str(), resolved_len);
     }
 
+    std::string short_prefix;
+    std::string short_ext;
+    if (parse_short_83_name(desired_name, &short_prefix, &short_ext)) {
+        std::string short_match;
+        int short_match_count = 0;
+        for (const std::string &candidate : key_names) {
+            const std::string candidate_lower = lowercase_ascii(base_name(candidate));
+            const size_t dot = candidate_lower.rfind('.');
+            const std::string candidate_stem =
+                (dot == std::string::npos) ? candidate_lower : candidate_lower.substr(0, dot);
+            const std::string candidate_ext =
+                (dot == std::string::npos) ? std::string() : candidate_lower.substr(dot);
+
+            if (!short_ext.empty() && candidate_ext != short_ext) {
+                continue;
+            }
+            if (candidate_stem.rfind(short_prefix, 0) == 0) {
+                short_match = candidate;
+                short_match_count++;
+            }
+        }
+
+        if (short_match_count == 1) {
+            if (resolved_key_name != nullptr) {
+                *resolved_key_name = short_match;
+            }
+            return terminal->get_loaded_key(short_match.c_str(), resolved_len);
+        }
+    }
+
     if (key_names.size() == 1) {
         if (resolved_key_name != nullptr) {
             *resolved_key_name = key_names.front();
@@ -1374,33 +2405,43 @@ const char *find_loaded_key_with_fallback(SSHTerminal *terminal,
     return nullptr;
 }
 
-esp_err_t connect_wifi_profile(SSHTerminal *terminal, const WifiProfile &profile, const char *context)
+esp_err_t connect_wifi_profile(SSHTerminal *terminal, const WifiProfile &profile, const char *context, bool verbose_ui)
 {
     if (terminal == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (profile.ssid.empty()) {
-        terminal->append_text("ERROR: wifi_config profile missing SSID\n");
+        if (verbose_ui) {
+            terminal->append_text("ERROR: wifi_config profile missing SSID\n");
+        } else {
+            ESP_LOGW(TAG, "wifi profile missing SSID");
+        }
         return ESP_FAIL;
     }
 
-    if (context != nullptr && context[0] != '\0') {
+    if (verbose_ui && context != nullptr && context[0] != '\0') {
         terminal->append_text(context);
         terminal->append_text("\n");
     }
 
-    terminal->append_text("WiFi profile connect: ");
-    if (!profile.network_name.empty()) {
-        terminal->append_text(profile.network_name.c_str());
-        terminal->append_text(" -> ");
+    if (verbose_ui) {
+        terminal->append_text("WiFi profile connect: ");
+        if (!profile.network_name.empty()) {
+            terminal->append_text(profile.network_name.c_str());
+            terminal->append_text(" -> ");
+        }
+        terminal->append_text(profile.ssid.c_str());
+        terminal->append_text("\n");
+    } else {
+        ESP_LOGI(TAG, "wifi auto boot: trying profile '%s' ssid='%s'",
+                 profile.network_name.empty() ? "<unnamed>" : profile.network_name.c_str(),
+                 profile.ssid.c_str());
     }
-    terminal->append_text(profile.ssid.c_str());
-    terminal->append_text("\n");
 
     return terminal->init_wifi(profile.ssid.c_str(), profile.password.c_str());
 }
 
-bool auto_connect_wifi_profiles(SSHTerminal *terminal)
+bool auto_connect_wifi_profiles(SSHTerminal *terminal, bool verbose_ui = true)
 {
     if (terminal == nullptr) {
         return false;
@@ -1408,7 +2449,11 @@ bool auto_connect_wifi_profiles(SSHTerminal *terminal)
 
     std::vector<WifiProfile> profiles;
     if (!parse_wifi_config_file(&profiles)) {
-        terminal->append_text("wifi auto: no wifi_config found (/sdcard/ssh_keys/wifi_config or /sdcard/wifi_config)\n");
+        if (verbose_ui) {
+            terminal->append_text("wifi auto: no wifi_config found (/sdcard/ssh_keys/wifi_config, /sdcard/wifi_config, /sd/ssh_keys/wifi_config, or /sd/wifi_config)\n");
+        } else {
+            ESP_LOGI(TAG, "wifi auto boot: no wifi_config");
+        }
         return false;
     }
 
@@ -1418,15 +2463,27 @@ bool auto_connect_wifi_profiles(SSHTerminal *terminal)
             continue;
         }
         attempted = true;
-        if (connect_wifi_profile(terminal, profile, "wifi auto: trying profile") == ESP_OK) {
-            terminal->append_text("wifi auto: connected\n");
+        if (connect_wifi_profile(terminal, profile, "wifi auto: trying profile", verbose_ui) == ESP_OK) {
+            if (verbose_ui) {
+                terminal->append_text("wifi auto: connected\n");
+            } else {
+                ESP_LOGI(TAG, "wifi auto boot: connected");
+            }
             return true;
         }
-        terminal->append_text("wifi auto: failed, trying next profile\n");
+        if (verbose_ui) {
+            terminal->append_text("wifi auto: failed, trying next profile\n");
+        } else {
+            ESP_LOGI(TAG, "wifi auto boot: failed profile, trying next");
+        }
     }
 
     if (!attempted) {
-        terminal->append_text("wifi auto: no AutoConnect true profiles\n");
+        if (verbose_ui) {
+            terminal->append_text("wifi auto: no AutoConnect true profiles\n");
+        } else {
+            ESP_LOGI(TAG, "wifi auto boot: no AutoConnect=true profiles");
+        }
     }
     return false;
 }
@@ -1439,7 +2496,7 @@ bool connect_wifi_profile_by_name_or_ssid(SSHTerminal *terminal, const std::stri
 
     std::vector<WifiProfile> profiles;
     if (!parse_wifi_config_file(&profiles)) {
-        terminal->append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config or /sdcard/wifi_config\n");
+        terminal->append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config, /sdcard/wifi_config, /sd/ssh_keys/wifi_config, or /sd/wifi_config\n");
         return false;
     }
 
@@ -1451,7 +2508,7 @@ bool connect_wifi_profile_by_name_or_ssid(SSHTerminal *terminal, const std::stri
         return false;
     }
 
-    return connect_wifi_profile(terminal, *profile, nullptr) == ESP_OK;
+    return connect_wifi_profile(terminal, *profile, nullptr, true) == ESP_OK;
 }
 
 bool connect_with_alias_identities(SSHTerminal *terminal, const ResolvedSSHConfig &resolved)
@@ -1460,12 +2517,31 @@ bool connect_with_alias_identities(SSHTerminal *terminal, const ResolvedSSHConfi
         return false;
     }
 
+    const int loaded_now = load_keys_from_sd_if_needed(terminal);
+    if (loaded_now > 0) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "Loaded %d key(s) from SD on demand\n", loaded_now);
+        terminal->append_text(line);
+    }
+
+    const std::vector<std::string> loaded_key_names = terminal->get_loaded_key_names();
+    ESP_LOGI(TAG, "alias connect: alias=%s host=%s user=%s identities=%d loaded_keys=%d",
+             resolved.alias.c_str(),
+             resolved.host_name.c_str(),
+             resolved.user.c_str(),
+             static_cast<int>(resolved.identity_files.size()),
+             static_cast<int>(loaded_key_names.size()));
+    for (const auto &loaded_name : loaded_key_names) {
+        ESP_LOGI(TAG, "alias connect: loaded key name=%s", loaded_name.c_str());
+    }
+
     bool attempted_identity = false;
     bool connected = false;
     for (const std::string &identity_path : resolved.identity_files) {
         std::string key_name = base_name(identity_path);
         size_t key_len = 0;
         const char *loaded_key = find_loaded_key_with_fallback(terminal, identity_path, &key_name, &key_len);
+        ESP_LOGI(TAG, "alias connect: trying identity=%s", identity_path.c_str());
 
         terminal->append_text("Trying identity: ");
         terminal->append_text(identity_path.c_str());
@@ -1473,6 +2549,9 @@ bool connect_with_alias_identities(SSHTerminal *terminal, const ResolvedSSHConfi
 
         attempted_identity = true;
         if (loaded_key != nullptr && key_len > 0) {
+            ESP_LOGI(TAG, "alias connect: using loaded key=%s len=%d",
+                     key_name.c_str(),
+                     static_cast<int>(key_len));
             if (key_name != base_name(identity_path)) {
                 terminal->append_text("  Using loaded key alias: ");
                 terminal->append_text(key_name.c_str());
@@ -1490,9 +2569,39 @@ bool connect_with_alias_identities(SSHTerminal *terminal, const ResolvedSSHConfi
         }
 
         std::string key_data;
-        if (!read_file_contents(identity_path, &key_data)) {
+        std::string resolved_path;
+        bool key_read_ok = false;
+        const std::vector<std::string> candidates = identity_path_candidates(identity_path);
+        for (const auto &candidate : candidates) {
+            ESP_LOGI(TAG, "alias connect: trying key file candidate=%s", candidate.c_str());
+            if (read_file_contents(candidate, &key_data)) {
+                resolved_path = candidate;
+                key_read_ok = true;
+                ESP_LOGI(TAG, "alias connect: read key file candidate=%s", candidate.c_str());
+                break;
+            }
+        }
+        if (!key_read_ok) {
+            const std::string resolved_sd_path = resolve_identity_file_on_sd(identity_path);
+            if (!resolved_sd_path.empty()) {
+                ESP_LOGI(TAG, "alias connect: trying resolved SD key path=%s", resolved_sd_path.c_str());
+            }
+            if (!resolved_sd_path.empty() && read_file_contents(resolved_sd_path, &key_data)) {
+                resolved_path = resolved_sd_path;
+                key_read_ok = true;
+                ESP_LOGI(TAG, "alias connect: read resolved SD key path=%s", resolved_sd_path.c_str());
+            }
+        }
+
+        if (!key_read_ok) {
+            ESP_LOGW(TAG, "alias connect: unable to read any key file for identity=%s", identity_path.c_str());
             terminal->append_text("  Skipping: unable to read key file\n");
             continue;
+        }
+        if (!resolved_path.empty() && resolved_path != identity_path) {
+            terminal->append_text("  Using key file path: ");
+            terminal->append_text(resolved_path.c_str());
+            terminal->append_text("\n");
         }
 
         if (terminal->connect_with_key(resolved.host_name.c_str(),
@@ -1525,7 +2634,7 @@ void connect_using_ssh_alias(SSHTerminal *terminal, const std::string &alias)
 
     ResolvedSSHConfig resolved = {};
     if (!resolve_ssh_alias(alias, &resolved)) {
-        terminal->append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config\n");
+        terminal->append_text("ERROR: Host alias not found in /sdcard/ssh_keys/ssh_config or /sd/ssh_keys/ssh_config\n");
         terminal->append_text("Hint: run 'hosts' to list available aliases.\n");
         return;
     }
@@ -1621,12 +2730,16 @@ SSHTerminal::SSHTerminal()
       cursor_blink_timer(NULL),
       cursor_visible(true),
       battery_update_timer(NULL),
+      debug_metrics_timer(NULL),
       history_needs_save(false),
       history_save_timer(NULL),
       last_display_update(0),
       wifi_connected(false),
+      boot_wifi_auto_connect_attempted(false),
       ssh_connected(false),
       battery_initialized(false),
+      serial_rx_in_progress(false),
+      flash_headroom_percent(-1),
       ssh_socket(-1),
       session(NULL),
       channel(NULL),
@@ -1671,6 +2784,9 @@ SSHTerminal::~SSHTerminal()
     }
     if (battery_update_timer) {
         lv_timer_del(battery_update_timer);
+    }
+    if (debug_metrics_timer) {
+        lv_timer_del(debug_metrics_timer);
     }
     if (history_save_timer) {
         lv_timer_del(history_save_timer);
@@ -1746,6 +2862,8 @@ esp_err_t SSHTerminal::init_wifi(const char* ssid, const char* password)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Keep WiFi credentials ephemeral; profiles are sourced from SD config at runtime.
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
@@ -1834,6 +2952,34 @@ bool SSHTerminal::is_wifi_connected()
     return wifi_connected;
 }
 
+bool SSHTerminal::is_serial_rx_in_progress() const
+{
+    return serial_rx_in_progress.load();
+}
+
+void SSHTerminal::set_serial_rx_in_progress(bool in_progress)
+{
+    serial_rx_in_progress.store(in_progress);
+}
+
+void SSHTerminal::try_boot_wifi_auto_connect()
+{
+    if (boot_wifi_auto_connect_attempted) {
+        return;
+    }
+    boot_wifi_auto_connect_attempted = true;
+
+    if (wifi_connected) {
+        ESP_LOGI(TAG, "wifi auto boot: already connected");
+        return;
+    }
+
+    ESP_LOGI(TAG, "wifi auto boot: attempt");
+    if (!auto_connect_wifi_profiles(this, false)) {
+        ESP_LOGI(TAG, "wifi auto boot: skipped/failed");
+    }
+}
+
 lv_obj_t* SSHTerminal::create_terminal_screen()
 {
     // Keep a minimal side inset so the 1px border is fully visible on panel edges
@@ -1860,13 +3006,13 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     #endif
     
     byte_counter_label = lv_label_create(terminal_screen);
-    lv_label_set_text(byte_counter_label, "0 B");
+    lv_label_set_text(byte_counter_label, "S-- P-- F--");
     #if defined(TPAGER_TARGET)
     lv_obj_set_style_text_color(byte_counter_label, lv_color_hex(0xAEE6FF), 0);
     #else
     lv_obj_set_style_text_color(byte_counter_label, lv_color_hex(0x00FFFF), 0);
     #endif
-    lv_obj_set_style_text_font(byte_counter_label, ui_font_body(), 0);
+    lv_obj_set_style_text_font(byte_counter_label, ui_font_small(), 0);
     #if defined(TPAGER_TARGET)
     lv_obj_align(byte_counter_label, LV_ALIGN_TOP_RIGHT, -4, 2);
     #else
@@ -1953,10 +3099,12 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
     cursor_blink_timer = lv_timer_create(cursor_blink_cb, 500, this);
     
     battery_update_timer = lv_timer_create(battery_update_cb, 60000, this);
+    debug_metrics_timer = lv_timer_create(debug_metrics_cb, 1000, this);
 
     load_default_terminal_font_mode_from_config();
     apply_terminal_font_mode();
     update_status_bar();
+    update_debug_metrics();
     
     history_save_timer = lv_timer_create(history_save_cb, 5000, this);
 
@@ -1980,7 +3128,7 @@ lv_obj_t* SSHTerminal::create_terminal_screen()
         "   connect <SSID> <PASSWORD>  - WiFi connect\n"
         "   fontsize [big|normal] - Toggle/set font size\n"
         "     Use quotes for spaces: connect \"My WiFi\" \"my pass\"\n"
-        "   hosts - List aliases from /sdcard/ssh_keys/ssh_config\n"
+        "   hosts - List aliases from /sdcard/ssh_keys/ssh_config or /sd/ssh_keys/ssh_config\n"
         "   ssh <HOST> <PORT> <USER> <PASS> - SSH\n"
         "   sshkey <HOST> <PORT> <USER> <KEYFILE> - SSH key\n"
         "   disconnect - WiFi off | exit - SSH off\n"
@@ -2006,26 +3154,25 @@ void SSHTerminal::append_text(const char* text)
     size_t current_len = current_text ? strlen(current_text) : 0;
     size_t new_len = strlen(text);
     
-    const size_t MAX_BUFFER_SIZE = 4096;
-    
-    if (current_len > MAX_BUFFER_SIZE * 0.8) {
-        lv_textarea_set_text(terminal_output, "...[cleared]\n");
-        current_len = 14;
-        
-        int64_t elapsed = (esp_timer_get_time() / 1000) - start_time;
-        if (elapsed > 500) {
-            ESP_LOGW(TAG, "Text clear took %lld ms, skipping append", elapsed);
-            return;
+    if (new_len > kTerminalAppendChunkBytes) {
+        text = text + (new_len - kTerminalAppendChunkBytes);
+        new_len = kTerminalAppendChunkBytes;
+    }
+
+    const size_t projected_len = current_len + new_len;
+    if (projected_len > kTerminalScrollbackBytes && current_len > 0) {
+        const size_t keep_len = (new_len >= kTerminalScrollbackBytes) ? 0 : (kTerminalScrollbackBytes - new_len);
+        if (keep_len == 0) {
+            lv_textarea_set_text(terminal_output, "");
+            current_len = 0;
+        } else if (current_len > keep_len) {
+            std::string keep_copy(current_text + (current_len - keep_len), keep_len);
+            lv_textarea_set_text(terminal_output, keep_copy.c_str());
+            current_len = keep_copy.size();
         }
     }
-    
-    const size_t MAX_CHUNK = 256;
-    if (new_len > MAX_CHUNK) {
-        text = text + (new_len - MAX_CHUNK);
-        new_len = MAX_CHUNK;
-    }
-    
-    if (current_len + new_len < MAX_BUFFER_SIZE) {
+
+    if (current_len + new_len <= kTerminalScrollbackBytes) {
         lv_textarea_add_text(terminal_output, text);
     }
     
@@ -2080,7 +3227,7 @@ void SSHTerminal::handle_key_input(char key)
                 if (args.empty()) {
                     std::vector<WifiProfile> profiles;
                     if (!parse_wifi_config_file(&profiles)) {
-                        append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config or /sdcard/wifi_config\n");
+                        append_text("No wifi_config found at /sdcard/ssh_keys/wifi_config, /sdcard/wifi_config, /sd/ssh_keys/wifi_config, or /sd/wifi_config\n");
                     } else if (profiles.empty()) {
                         append_text("No WiFi profiles found in wifi_config\n");
                     } else {
@@ -2108,6 +3255,20 @@ void SSHTerminal::handle_key_input(char key)
                         append_text("WiFi connected via profile\n");
                     } else {
                         append_text("WiFi profile connection failed\n");
+                    }
+                }
+            }
+            else if (current_input == "sdcheck") {
+                append_sd_probe(this);
+            }
+            else if (current_input.rfind("serialrx", 0) == 0) {
+                if (ssh_connected) {
+                    append_text("serialrx unavailable during active SSH session\n");
+                } else {
+                    const std::vector<std::string> args = split_quoted_arguments(current_input, 8);
+                    const std::string target_name = args.empty() ? kDefaultSerialRxFilename : args[0];
+                    if (!serial_receive_to_sd_file(this, target_name)) {
+                        append_text("serialrx: failed\n");
                     }
                 }
             }
@@ -2211,15 +3372,18 @@ void SSHTerminal::handle_key_input(char key)
                 append_text("  wifi - List configured WiFi profiles\n");
                 append_text("  wifi <Network|SSID> - Connect using wifi_config\n");
                 append_text("  wifi auto - Try AutoConnect profiles\n");
-                append_text("  hosts - List aliases from /sdcard/ssh_keys/ssh_config\n");
+                append_text("  hosts - List aliases from /sdcard/ssh_keys/ssh_config or /sd/ssh_keys/ssh_config\n");
                 append_text("  connect <ALIAS> - Resolve alias from ssh_config and connect via key\n");
                 append_text("  connect <SSID> <PASSWORD> - Connect to WiFi\n");
                 append_text("    Use quotes for spaces: connect \"My WiFi\" password\n");
                 append_text("  netinfo - Show WiFi IP/netmask/gateway\n");
+                append_text("  sdcheck - Probe SD mountpoints and config visibility\n");
+                append_text("  serialrx [filename] - Receive file into SD root (default: PocketSSH-TPager.bin)\n");
+                append_text("    Protocol: BEGIN <size> <crc32hex>, DATA <hex>, END\n");
                 append_text("  ssh <ALIAS> - Resolve alias from ssh_config and connect via key\n");
                 append_text("  ssh <HOST> <PORT> <USER> <PASS> - Connect via SSH\n");
                 append_text("  sshkey <HOST> <PORT> <USER> <KEYFILE> - Connect via SSH with private key\n");
-                append_text("    Note: Place .pem keys in /sdcard/ssh_keys/ before use\n");
+                append_text("    Note: Place .pem keys in /sdcard/ssh_keys/ or /sd/ssh_keys/\n");
                 append_text("  shutdown | poweroff - Deep sleep (wake via BOOT or encoder button)\n");
                 append_text("  disconnect - Disconnect WiFi\n");
                 append_text("  fontsize - Toggle terminal font size (not during SSH)\n");
@@ -2239,7 +3403,7 @@ void SSHTerminal::handle_key_input(char key)
             else if (current_input == "hosts") {
                 SSHConfigFile parsed = {};
                 if (!parse_ssh_config_file(&parsed)) {
-                    append_text("No ssh_config found at /sdcard/ssh_keys/ssh_config\n");
+                    append_text("No ssh_config found at /sdcard/ssh_keys/ssh_config or /sd/ssh_keys/ssh_config\n");
                 } else if (parsed.aliases.empty()) {
                     append_text("No explicit Host aliases found in ssh_config\n");
                 } else {
@@ -2471,6 +3635,19 @@ void SSHTerminal::battery_update_cb(lv_timer_t* timer)
             display_unlock();
         }
     }
+}
+
+void SSHTerminal::debug_metrics_cb(lv_timer_t* timer)
+{
+    SSHTerminal* terminal = (SSHTerminal*)lv_timer_get_user_data(timer);
+    if (terminal == nullptr) {
+        return;
+    }
+    if (!display_lock(0)) {
+        return;
+    }
+    terminal->update_debug_metrics();
+    display_unlock();
 }
 
 void SSHTerminal::history_save_cb(lv_timer_t* timer)
@@ -3187,10 +4364,6 @@ void SSHTerminal::send_command(const char* cmd)
     }
     
     bytes_received = 0;
-    if (byte_counter_label && display_lock(0)) {
-        lv_label_set_text(byte_counter_label, "0 B");
-        display_unlock();
-    }
 
     std::string full_cmd = std::string(cmd) + "\n";
     ssize_t nwritten = 0;
@@ -3311,11 +4484,11 @@ void SSHTerminal::process_received_data(const char* data, size_t len)
     
     int64_t current_time = esp_timer_get_time() / 1000;
     
-    if (text_buffer.size() > 2048) {
-        text_buffer = text_buffer.substr(text_buffer.size() - 1024);
+    if (text_buffer.size() > kTerminalIngressMaxBytes) {
+        text_buffer = text_buffer.substr(text_buffer.size() - kTerminalIngressKeepBytes);
     }
     
-    if (current_time - last_display_update >= 1000) {
+    if (current_time - last_display_update >= kTerminalFlushIntervalMs) {
         flush_display_buffer();
     }
     
@@ -3347,19 +4520,6 @@ void SSHTerminal::flush_display_buffer()
     
     if (offset > 0) {
         text_buffer = text_buffer.substr(offset);
-    }
-    
-    if (bytes_received > 0 && byte_counter_label && display_lock(0)) {
-        char counter_text[32];
-        if (bytes_received < 1024) {
-            snprintf(counter_text, sizeof(counter_text), "%zu B", bytes_received);
-        } else if (bytes_received < 1024 * 1024) {
-            snprintf(counter_text, sizeof(counter_text), "%.1f KB", bytes_received / 1024.0);
-        } else {
-            snprintf(counter_text, sizeof(counter_text), "%.2f MB", bytes_received / (1024.0 * 1024.0));
-        }
-        lv_label_set_text(byte_counter_label, counter_text);
-        display_unlock();
     }
     
     if (text_buffer.empty()) {
@@ -3414,6 +4574,42 @@ void SSHTerminal::set_terminal_font_mode(bool big_mode, bool announce)
             append_text("fontsize set to normal (~67x13)\n");
         }
     }
+}
+
+void SSHTerminal::update_debug_metrics()
+{
+    if (byte_counter_label == nullptr) {
+        return;
+    }
+
+    const int sram_free_pct = free_percent_for_caps(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const int psram_free_pct = free_percent_for_caps(MALLOC_CAP_SPIRAM);
+    if (flash_headroom_percent < 0) {
+        flash_headroom_percent = app_flash_headroom_percent();
+    }
+
+    auto fmt_pct = [](int pct, char out[4]) {
+        if (pct < 0) {
+            std::strcpy(out, "--");
+            return;
+        }
+        if (pct > 99) {
+            std::strcpy(out, "99+");
+            return;
+        }
+        std::snprintf(out, 4, "%02d", pct);
+    };
+
+    char sram_txt[4];
+    char psram_txt[4];
+    char flash_txt[4];
+    fmt_pct(sram_free_pct, sram_txt);
+    fmt_pct(psram_free_pct, psram_txt);
+    fmt_pct(flash_headroom_percent, flash_txt);
+
+    char line[32];
+    std::snprintf(line, sizeof(line), "S%s P%s F%s", sram_txt, psram_txt, flash_txt);
+    lv_label_set_text(byte_counter_label, line);
 }
 
 void SSHTerminal::update_status_bar()

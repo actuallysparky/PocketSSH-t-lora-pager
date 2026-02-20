@@ -9,6 +9,7 @@
 
 #include "lvgl.h"
 #include "esp_err.h"
+#include <atomic>
 #include <string>
 #include <vector>
 #include <map>
@@ -47,6 +48,9 @@ public:
     
     esp_err_t init_wifi(const char* ssid, const char* password);
     bool is_wifi_connected();
+    void try_boot_wifi_auto_connect();
+    bool is_serial_rx_in_progress() const;
+    void set_serial_rx_in_progress(bool in_progress);
     
     lv_obj_t* get_screen() { return terminal_screen; }
     
@@ -75,6 +79,7 @@ private:
     bool cursor_visible;
     
     lv_timer_t* battery_update_timer;
+    lv_timer_t* debug_metrics_timer;
     
     bool history_needs_save;
     lv_timer_t* history_save_timer;
@@ -83,8 +88,11 @@ private:
     int64_t last_display_update;
     
     bool wifi_connected;
+    bool boot_wifi_auto_connect_attempted;
     bool ssh_connected;
     bool battery_initialized;
+    std::atomic<bool> serial_rx_in_progress;
+    int flash_headroom_percent;
     
     BatteryMeasurement battery;
     
@@ -133,12 +141,14 @@ private:
     static void input_touch_event_cb(lv_event_t* e);
     static void cursor_blink_cb(lv_timer_t* timer);
     static void battery_update_cb(lv_timer_t* timer);
+    static void debug_metrics_cb(lv_timer_t* timer);
     static void history_save_cb(lv_timer_t* timer);
     static void ssh_receive_task(void* param);
 
     void apply_terminal_font_mode();
     void set_terminal_font_mode(bool big_mode, bool announce);
     void load_default_terminal_font_mode_from_config();
+    void update_debug_metrics();
     
     static int waitsocket(int socket_fd, LIBSSH2_SESSION *session);
     esp_err_t ssh_authenticate(const char* username, const char* password);

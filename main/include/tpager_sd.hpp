@@ -16,5 +16,6 @@ struct SdDiagStats {
 // Mount /sdcard via SDSPI on T-Pager shared SPI bus and count keys in /sdcard/ssh_keys.
 esp_err_t sd_mount_and_scan_keys(SdDiagStats *stats);
 esp_err_t sd_unmount();
+bool sd_is_mounted();
 
 }  // namespace tpager

@@ -8,11 +8,15 @@
  */
 
 #include <cinttypes>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
+#include <string>
 #include <strings.h>
+#include <unistd.h>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -53,6 +57,7 @@ constexpr gpio_num_t kBootButton = GPIO_NUM_0;
 constexpr gpio_num_t kDisplayBacklight = GPIO_NUM_42;
 
 constexpr const char *kKeysDir = "/sdcard/ssh_keys";
+constexpr const char *kKeysDirAlt = "/sd/ssh_keys";
 constexpr size_t kMaxKeySize = 16 * 1024;
 
 constexpr TickType_t ticks_from_ms(uint32_t ms)
@@ -149,6 +154,11 @@ void append_terminal_text(const char *text)
     if (g_terminal == nullptr || text == nullptr) {
         return;
     }
+    // Boot-order contract: SD preload can run before LVGL init. In that phase,
+    // skip UI writes to avoid taking an uninitialized LVGL lock.
+    if (!g_display.initialized) {
+        return;
+    }
     if (!lvgl_port_lock(25)) {
         return;
     }
@@ -166,6 +176,82 @@ void handle_terminal_key(char key)
     }
     g_terminal->handle_key_input(key);
     lvgl_port_unlock();
+}
+
+std::string trim_ascii(const std::string &input)
+{
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin])) != 0) {
+        ++begin;
+    }
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1])) != 0) {
+        --end;
+    }
+    return input.substr(begin, end - begin);
+}
+
+bool starts_with_ascii(const std::string &value, const char *prefix)
+{
+    if (prefix == nullptr) {
+        return false;
+    }
+    const size_t prefix_len = std::strlen(prefix);
+    if (value.size() < prefix_len) {
+        return false;
+    }
+    return value.compare(0, prefix_len, prefix) == 0;
+}
+
+void inject_terminal_command(const std::string &line)
+{
+    if (g_terminal == nullptr || line.empty()) {
+        return;
+    }
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(kTag, "serial ctl: LVGL lock timeout for command '%s'", line.c_str());
+        return;
+    }
+    for (char c : line) {
+        g_terminal->handle_key_input(c);
+    }
+    g_terminal->handle_key_input('\n');
+    lvgl_port_unlock();
+}
+
+void handle_serial_control_line(const std::string &raw_line)
+{
+    static constexpr const char *kCtlPrefix = "__pocketctl ";
+    if (!starts_with_ascii(raw_line, kCtlPrefix)) {
+        return;
+    }
+
+    const std::string payload = trim_ascii(raw_line.substr(std::strlen(kCtlPrefix)));
+    if (payload.empty()) {
+        return;
+    }
+
+    if (payload == "ping") {
+        ESP_LOGI(kTag, "POCKETCTL pong");
+        return;
+    }
+
+    if (payload == "serialrx" || starts_with_ascii(payload, "serialrx ")) {
+        ESP_LOGI(kTag, "POCKETCTL run: %s", payload.c_str());
+        inject_terminal_command(payload);
+        return;
+    }
+
+    if (starts_with_ascii(payload, "cmd ")) {
+        const std::string cmd = trim_ascii(payload.substr(4));
+        if (!cmd.empty()) {
+            ESP_LOGI(kTag, "POCKETCTL run cmd: %s", cmd.c_str());
+            inject_terminal_command(cmd);
+        }
+        return;
+    }
+
+    ESP_LOGW(kTag, "POCKETCTL unknown command: %s", payload.c_str());
 }
 
 bool to_terminal_char(const tpager::Tca8418Event &ev, char *out_key)
@@ -199,11 +285,15 @@ bool has_pem_extension(const char *name)
     if (name == nullptr) {
         return false;
     }
-    const size_t len = std::strlen(name);
-    if (len < 5) {
+    if ((name[0] == '.' && name[1] == '_') || (name[0] == '_' && std::strchr(name, '~') != nullptr)) {
         return false;
     }
-    return strcasecmp(name + len - 4, ".pem") == 0;
+    const size_t len = std::strlen(name);
+    if (len >= 4 && strcasecmp(name + len - 4, ".pem") == 0) {
+        return true;
+    }
+    // Some FAT variants expose short names without dot separators (e.g. FOO~1PEM).
+    return (len >= 3) && (strcasecmp(name + len - 3, "pem") == 0);
 }
 
 void load_ssh_keys_from_sd()
@@ -215,15 +305,17 @@ void load_ssh_keys_from_sd()
     tpager::SdDiagStats stats = {};
     const esp_err_t mount_ret = tpager::sd_mount_and_scan_keys(&stats);
     if (mount_ret != ESP_OK) {
-        ESP_LOGW(kTag, "SD mount/scan failed: %s", esp_err_to_name(mount_ret));
-        append_terminal_text("SD key scan failed\n");
-        return;
+        ESP_LOGW(kTag, "SD mount/scan failed: %s; trying existing mountpoints", esp_err_to_name(mount_ret));
     }
 
+    const char *active_keys_dir = kKeysDir;
     DIR *dir = opendir(kKeysDir);
     if (dir == nullptr) {
-        append_terminal_text("No /sdcard/ssh_keys directory\n");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
+        active_keys_dir = kKeysDirAlt;
+        dir = opendir(kKeysDirAlt);
+    }
+    if (dir == nullptr) {
+        append_terminal_text("No /sdcard/ssh_keys or /sd/ssh_keys directory\n");
         return;
     }
 
@@ -237,12 +329,11 @@ void load_ssh_keys_from_sd()
             continue;
         }
 
-        char filepath[256];
-        std::snprintf(filepath, sizeof(filepath), "%s/%s", kKeysDir, entry->d_name);
+        const std::string filepath = std::string(active_keys_dir) + "/" + entry->d_name;
 
-        FILE *f = std::fopen(filepath, "rb");
+        FILE *f = std::fopen(filepath.c_str(), "rb");
         if (f == nullptr) {
-            ESP_LOGW(kTag, "Failed to open key %s", filepath);
+            ESP_LOGW(kTag, "Failed to open key %s", filepath.c_str());
             continue;
         }
 
@@ -250,7 +341,7 @@ void load_ssh_keys_from_sd()
         const long file_size = std::ftell(f);
         std::fseek(f, 0, SEEK_SET);
         if (file_size <= 0 || file_size > static_cast<long>(kMaxKeySize)) {
-            ESP_LOGW(kTag, "Skipping key %s (size=%ld)", filepath, file_size);
+            ESP_LOGW(kTag, "Skipping key %s (size=%ld)", filepath.c_str(), file_size);
             std::fclose(f);
             continue;
         }
@@ -259,7 +350,7 @@ void load_ssh_keys_from_sd()
         const size_t bytes_read = std::fread(key_data.data(), 1, static_cast<size_t>(file_size), f);
         std::fclose(f);
         if (bytes_read != static_cast<size_t>(file_size)) {
-            ESP_LOGW(kTag, "Short read for key %s", filepath);
+            ESP_LOGW(kTag, "Short read for key %s", filepath.c_str());
             continue;
         }
 
@@ -268,8 +359,6 @@ void load_ssh_keys_from_sd()
     }
 
     closedir(dir);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::sd_unmount());
-
     char summary[80];
     std::snprintf(summary, sizeof(summary), "Loaded %" PRId32 " key(s) from SD\n", keys_loaded);
     append_terminal_text(summary);
@@ -368,6 +457,57 @@ void poll_encoder()
     tpager::diag_display_set_encoder_stats(&g_display, g_encoder_net, g_encoder_transitions);
 }
 
+void serial_control_task(void *)
+{
+    // Host automation contract: allow prefixed commands over USB serial so CI
+    // tooling can trigger "serialrx" without manual keyboard entry.
+    const int stdin_fd = fileno(stdin);
+    if (stdin_fd >= 0) {
+        const int flags = fcntl(stdin_fd, F_GETFL, 0);
+        if (flags >= 0) {
+            (void)fcntl(stdin_fd, F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+
+    std::string line;
+    line.reserve(256);
+    char buf[96];
+
+    while (true) {
+        if (g_terminal != nullptr && g_terminal->is_serial_rx_in_progress()) {
+            vTaskDelay(ticks_from_ms(20));
+            continue;
+        }
+
+        ssize_t nread = -1;
+        if (stdin_fd >= 0) {
+            nread = read(stdin_fd, buf, sizeof(buf));
+        }
+
+        if (nread <= 0) {
+            vTaskDelay(ticks_from_ms(20));
+            continue;
+        }
+
+        for (ssize_t i = 0; i < nread; ++i) {
+            const char ch = buf[i];
+            if (ch == '\r') {
+                continue;
+            }
+            if (ch == '\n') {
+                if (!line.empty()) {
+                    handle_serial_control_line(line);
+                    line.clear();
+                }
+                continue;
+            }
+            if (line.size() < 512) {
+                line.push_back(ch);
+            }
+        }
+    }
+}
+
 void runtime_task(void *)
 {
     g_runtime_task_handle = xTaskGetCurrentTaskHandle();
@@ -379,6 +519,17 @@ void runtime_task(void *)
         poll_keyboard();
         poll_encoder();
     }
+}
+
+void boot_wifi_task(void *)
+{
+    // Startup contract: defer auto-connect off app_main so input runtime starts
+    // immediately and watchdog-sensitive LVGL/network work does not block boot.
+    vTaskDelay(ticks_from_ms(200));
+    if (g_terminal != nullptr) {
+        g_terminal->try_boot_wifi_auto_connect();
+    }
+    vTaskDelete(nullptr);
 }
 
 void shutdown_task(void *)
@@ -460,17 +611,35 @@ extern "C" void app_main(void)
 
     ESP_LOGI(kTag, "===== TPAGER TARGET BOOT =====");
 
-    ret = tpager::diag_display_init(&g_display);
-    if (ret == ESP_OK) {
-        tpager::diag_display_set_stage(&g_display, "Stage: init I2C");
-        tpager::diag_display_set_last_line(&g_display, "Runtime booting");
+    // Initialize I2C/peripheral controls before display starts using shared SPI.
+    // This lets SD mount happen while SPI is otherwise idle.
+    bool i2c_ready = false;
+    ret = i2c_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "i2c_init failed: %s", esp_err_to_name(ret));
+    } else {
+        i2c_ready = true;
     }
 
-    ESP_ERROR_CHECK(i2c_init());
-    ESP_ERROR_CHECK(tpager::xl9555_init(&g_xl9555, kI2CPort, 0x20, kI2CTimeoutTicks));
-    ESP_ERROR_CHECK(tpager::tca8418_init(&g_tca8418, kI2CPort, kTCA8418Addr, kI2CTimeoutTicks));
+    bool xl9555_ready = false;
+    bool tca_ready = false;
+    if (i2c_ready) {
+        ret = tpager::xl9555_init(&g_xl9555, kI2CPort, 0x20, kI2CTimeoutTicks);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "xl9555_init failed: %s", esp_err_to_name(ret));
+        } else {
+            xl9555_ready = true;
+        }
 
-    if (tpager::xl9555_probe(g_xl9555) == ESP_OK) {
+        ret = tpager::tca8418_init(&g_tca8418, kI2CPort, kTCA8418Addr, kI2CTimeoutTicks);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "tca8418_init failed: %s", esp_err_to_name(ret));
+        } else {
+            tca_ready = true;
+        }
+    }
+
+    if (xl9555_ready && tpager::xl9555_probe(g_xl9555) == ESP_OK) {
         if (tpager::xl9555_set_dir(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, true) == ESP_OK) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(tpager::xl9555_write_pin(g_xl9555, tpager::XL9555_PIN_SD_POWER_EN, true));
         }
@@ -478,37 +647,69 @@ extern "C" void app_main(void)
         ESP_LOGW(kTag, "XL9555 not reachable, skipping SD power control");
     }
 
-    tpager::diag_display_set_stage(&g_display, "Stage: keyboard init");
-    bool keyboard_ok = keyboard_power_reset(tpager::XL9555_PIN_KB_POWER_EN_PRIMARY);
-    if (!keyboard_ok) {
-        keyboard_ok = keyboard_power_reset(tpager::XL9555_PIN_KB_POWER_EN_FALLBACK);
+    // Create terminal backend early so keys can preload before LVGL/display starts.
+    if (g_terminal == nullptr) {
+        g_terminal = new SSHTerminal();
     }
-    ESP_ERROR_CHECK(tpager::tca8418_configure_matrix(&g_tca8418, 4, 10));
-    ESP_ERROR_CHECK(tpager::tca8418_flush_fifo(g_tca8418));
+    load_ssh_keys_from_sd();
+
+    ret = tpager::diag_display_init(&g_display);
+    if (ret == ESP_OK) {
+        tpager::diag_display_set_stage(&g_display, "Stage: init I2C");
+        tpager::diag_display_set_last_line(&g_display, "Runtime booting");
+    }
+
+    tpager::diag_display_set_stage(&g_display, "Stage: keyboard init");
+    bool keyboard_ok = false;
+    if (tca_ready && xl9555_ready) {
+        keyboard_ok = keyboard_power_reset(tpager::XL9555_PIN_KB_POWER_EN_PRIMARY);
+        if (!keyboard_ok) {
+            keyboard_ok = keyboard_power_reset(tpager::XL9555_PIN_KB_POWER_EN_FALLBACK);
+        }
+        ret = tpager::tca8418_configure_matrix(&g_tca8418, 4, 10);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "tca8418_configure_matrix failed: %s", esp_err_to_name(ret));
+            keyboard_ok = false;
+        }
+        ret = tpager::tca8418_flush_fifo(g_tca8418);
+        if (ret != ESP_OK) {
+            ESP_LOGE(kTag, "tca8418_flush_fifo failed: %s", esp_err_to_name(ret));
+            keyboard_ok = false;
+        }
+    } else {
+        ESP_LOGW(kTag, "Skipping keyboard init (i2c/tca/xl9555 unavailable)");
+    }
 
     gpio_config_t irq_cfg = {};
     irq_cfg.mode = GPIO_MODE_INPUT;
     irq_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
     irq_cfg.pin_bit_mask = (1ULL << kKeyboardIrq);
-    ESP_ERROR_CHECK(gpio_config(&irq_cfg));
-    ESP_ERROR_CHECK(gpio_set_intr_type(kKeyboardIrq, GPIO_INTR_NEGEDGE));
-    ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_ERROR_CHECK(ret);
+    ret = gpio_config(&irq_cfg);
+    if (ret == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_set_intr_type(kKeyboardIrq, GPIO_INTR_NEGEDGE));
+        ret = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(kTag, "gpio_install_isr_service failed: %s", esp_err_to_name(ret));
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_add(kKeyboardIrq, keyboard_irq_isr, nullptr));
+        }
+    } else {
+        ESP_LOGW(kTag, "keyboard IRQ gpio_config failed: %s", esp_err_to_name(ret));
     }
-    ESP_ERROR_CHECK(gpio_isr_handler_add(kKeyboardIrq, keyboard_irq_isr, nullptr));
 
     tpager::diag_display_set_stage(&g_display, keyboard_ok ? "Stage: keyboard ready" : "Stage: keyboard degraded");
     ESP_LOGI(kTag, "keyboard init: %s", keyboard_ok ? "PASS" : "DEGRADED");
 
     tpager::diag_display_set_stage(&g_display, "Stage: encoder init");
-    ESP_ERROR_CHECK(tpager::encoder_init(&g_encoder, kEncoderA, kEncoderB, kEncoderCenter));
+    ret = tpager::encoder_init(&g_encoder, kEncoderA, kEncoderB, kEncoderCenter);
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "encoder init failed: %s", esp_err_to_name(ret));
+    }
     tpager::diag_display_set_encoder_stats(&g_display, g_encoder_net, g_encoder_transitions);
     tpager::diag_display_set_keyboard_stats(&g_display, g_keyboard_events, g_keyboard_presses, g_keyboard_releases,
                                             gpio_get_level(kKeyboardIrq));
 
     tpager::diag_display_set_stage(&g_display, "Stage: terminal init");
-    g_terminal = new SSHTerminal();
     if (g_terminal != nullptr && lvgl_port_lock(50)) {
         lv_obj_t *screen = g_terminal->create_terminal_screen();
         lv_scr_load(screen);
@@ -523,9 +724,24 @@ extern "C" void app_main(void)
         ESP_LOGE(kTag, "Failed to initialize terminal UI");
     }
 
-    load_ssh_keys_from_sd();
+    BaseType_t runtime_ok =
+        xTaskCreatePinnedToCore(runtime_task, "tpager_runtime_task", 8192, nullptr, 5, nullptr, 1);
+    if (runtime_ok != pdPASS) {
+        ESP_LOGE(kTag, "Failed to start runtime task; keyboard/encoder disabled");
+    }
+    BaseType_t serial_ctl_ok =
+        xTaskCreatePinnedToCore(serial_control_task, "tpager_serial_ctl", 4096, nullptr, 3, nullptr, 0);
+    if (serial_ctl_ok != pdPASS) {
+        ESP_LOGW(kTag, "Failed to start serial control task; __pocketctl disabled");
+    }
 
-    xTaskCreatePinnedToCore(runtime_task, "tpager_runtime_task", 8192, nullptr, 5, nullptr, 1);
+    // Profile contract: if wifi_config includes AutoConnect=true profiles, try
+    // them once during boot so alias-based SSH can work immediately.
+    BaseType_t wifi_boot_ok =
+        xTaskCreatePinnedToCore(boot_wifi_task, "tpager_boot_wifi", 8192, nullptr, 4, nullptr, 0);
+    if (wifi_boot_ok != pdPASS) {
+        ESP_LOGW(kTag, "Failed to start boot wifi task; skipping auto-connect");
+    }
 
     while (true) {
         vTaskDelay(ticks_from_ms(1000));
